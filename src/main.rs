@@ -2,8 +2,8 @@ mod util;
 
 use ash::extensions::khr::{Surface, Swapchain};
 
-use crate::util::{AllocUsage, AllocatedImage, Allocator, DeletionQueue, DescriptorAllocator, DescriptorLayoutBuilder, PoolSizeRatio, load_shader_module};
-use ash::vk::{CommandBuffer, DescriptorSet, DescriptorSetLayout, Image, ImageView, Pipeline, PipelineLayout, ShaderModule, SwapchainKHR};
+use crate::util::{AllocUsage, AllocatedImage, Allocator, DeletionQueue, DescriptorAllocator, DescriptorLayoutBuilder, PoolSizeRatio, load_shader_module, PipelineBuilder};
+use ash::vk::{CommandBuffer, DescriptorSet, DescriptorSetLayout, Image, ImageView, Pipeline, PipelineColorBlendAttachmentState, PipelineLayout, ShaderModule, SwapchainKHR};
 use ash::{vk, Device, Instance};
 use gpu_alloc::GpuAllocator;
 use gpu_alloc_ash::device_properties;
@@ -42,9 +42,10 @@ struct App {
     descriptor_allocator: DescriptorAllocator,
     draw_image_descriptor_set: vk::DescriptorSet,
     draw_image_descriptor_set_layout: vk::DescriptorSetLayout,
-    gradient_pipeline: vk::Pipeline,
-    gradient_pipeline_layout: vk::PipelineLayout,
-    gradient_shader: ShaderModule,
+    triangle_pipeline_layout: vk::PipelineLayout,
+    triangle_pipeline: vk::Pipeline,
+    vertex_shader: ShaderModule,
+    frag_shader: ShaderModule,
 }
 
 impl App {
@@ -87,7 +88,7 @@ impl App {
             Self::create_swapchain(&instance, &device, surface_khr, capabilities, &mut allocator);
         let frames = Self::init_commands(graphics_queue.1, &device);
         let (descriptor_allocator, draw_image_descriptor_set_layout, draw_image_descriptor_set) = Self::init_descriptors(&device, draw_image.view);
-        let (gradient_pipeline_layout, gradient_pipeline, gradient_shader) = Self::init_pipelines(&device, draw_image_descriptor_set_layout);
+        let (triangle_pipeline_layout, triangle_pipeline, vertex_shader, frag_shader) = Self::init_pipelines(&device, draw_image_descriptor_set_layout);
         
         Ok(App {
             entry,
@@ -110,9 +111,10 @@ impl App {
             descriptor_allocator,
             draw_image_descriptor_set,
             draw_image_descriptor_set_layout,
-            gradient_pipeline_layout,
-            gradient_pipeline,
-            gradient_shader,
+            vertex_shader,
+            frag_shader,
+            triangle_pipeline_layout,
+            triangle_pipeline,
         })
     }
 
@@ -206,7 +208,7 @@ impl App {
             .build();
 
         let binding = [Swapchain::name().as_ptr()];
-        let mut device_create_info_builder = vk::DeviceCreateInfo::builder()
+        let device_create_info_builder = vk::DeviceCreateInfo::builder()
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(&binding)
             .enabled_features(&device_features)
@@ -383,12 +385,22 @@ impl App {
 
             self.draw_background(cmd_buffer);
 
-            // prepare copying of the draw image to the swapchain image
             util::transition_image(
                 &self.device,
                 cmd_buffer,
                 self.draw_image.image,
                 vk::ImageLayout::GENERAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            );
+
+            self.draw_geometry(cmd_buffer);
+
+            // prepare copying of the draw image to the swapchain image
+            util::transition_image(
+                &self.device,
+                cmd_buffer,
+                self.draw_image.image,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             );
             util::transition_image(
@@ -457,36 +469,60 @@ impl App {
     }
 
     fn draw_background(&self, cmd: CommandBuffer) {
-        // let flash = (self.current_frame as f32 / 120.0).sin().abs();
-        // let clear_value = vk::ClearColorValue {
-        //     float32: [0.0, 0.0, flash, 1.0],
-        // };
-        // let clear_range = vk::ImageSubresourceRange::builder()
-        //     .level_count(vk::REMAINING_MIP_LEVELS)
-        //     .layer_count(vk::REMAINING_ARRAY_LAYERS)
-        //     .aspect_mask(vk::ImageAspectFlags::COLOR);
-        // 
-        // unsafe {
-        //     self.device.cmd_clear_color_image(
-        //         cmd,
-        //         self.draw_image.image,
-        //         vk::ImageLayout::GENERAL,
-        //         &clear_value,
-        //         &[clear_range.build()],
-        //     );
-        // }
-        
+        let flash = (self.current_frame as f32 / 120.0).sin().abs();
+        let clear_value = vk::ClearColorValue {
+            float32: [0.0, 0.0, flash, 1.0],
+        };
+        let clear_range = vk::ImageSubresourceRange::builder()
+            .level_count(vk::REMAINING_MIP_LEVELS)
+            .layer_count(vk::REMAINING_ARRAY_LAYERS)
+            .aspect_mask(vk::ImageAspectFlags::COLOR);
+
         unsafe {
-            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.gradient_pipeline);
-            self.device.cmd_bind_descriptor_sets(
+            self.device.cmd_clear_color_image(
                 cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                self.gradient_pipeline_layout,
-                0,
-                &[self.draw_image_descriptor_set],
-                &[],
+                self.draw_image.image,
+                vk::ImageLayout::GENERAL,
+                &clear_value,
+                &[clear_range.build()],
             );
-            self.device.cmd_dispatch(cmd, (Self::WIDTH as f32/ 16.0).ceil() as u32, (Self::HEIGHT as f32 / 16.0).ceil() as u32, 1);
+        }
+    }
+
+    fn draw_geometry(&self, cmd: CommandBuffer) {
+        let color_attachment = vk::RenderingAttachmentInfo::builder()
+            .image_view(self.draw_image.view)
+            .image_layout(vk::ImageLayout::GENERAL);
+        let color_attachments = [color_attachment.build()];
+        let render_info = vk::RenderingInfo::builder()
+            .color_attachments(&color_attachments)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: Self::WIDTH,
+                    height: Self::HEIGHT,
+                },
+            })
+            .layer_count(1)
+            .view_mask(0);
+        unsafe {
+            self.device.cmd_begin_rendering(cmd, &render_info);
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.triangle_pipeline);
+        };
+        let viewport = vk::Viewport::builder()
+            .width(Self::WIDTH as f32)
+            .height(Self::HEIGHT as f32)
+            .max_depth(1.0);
+        let scissor = vk::Rect2D::builder()
+            .extent(vk::Extent2D {
+                width: Self::WIDTH,
+                height: Self::HEIGHT,
+            });
+        unsafe {
+            self.device.cmd_set_viewport(cmd, 0, &[viewport.build()]);
+            self.device.cmd_set_scissor(cmd, 0, &[scissor.build()]);
+            self.device.cmd_draw(cmd, 3, 1, 0, 0);
+            self.device.cmd_end_rendering(cmd);
         }
     }
 
@@ -513,25 +549,63 @@ impl App {
         (descriptor_pool, layout, descriptor_set)
     }
     
-    fn init_pipelines(device: &Device, draw_image_descriptor_set_layout: vk::DescriptorSetLayout) -> (PipelineLayout, Pipeline, ShaderModule) {
-        Self::init_background_pipelines(device, draw_image_descriptor_set_layout)
+    fn init_pipelines(device: &Device, draw_image_descriptor_set_layout: vk::DescriptorSetLayout) -> (PipelineLayout, Pipeline, ShaderModule, ShaderModule) {
+        Self::init_triangle_pipeline(device)
     }
 
-    fn init_background_pipelines(device: &Device, draw_image_descriptor_set_layout: vk::DescriptorSetLayout) -> (PipelineLayout, Pipeline, ShaderModule) {
-        let set_layouts = [draw_image_descriptor_set_layout];
-        let layout_create_info = vk::PipelineLayoutCreateInfo::builder().set_layouts(&set_layouts);
+
+    fn init_triangle_pipeline(device: &Device) -> (PipelineLayout, Pipeline, ShaderModule, ShaderModule) {
+        let vertex_shader = load_shader_module(device, include_bytes!("shaders/spirv/triangle.vert.spv")).expect("Failed to load vertex shader module");
+        let fragment_shader = load_shader_module(device, include_bytes!("shaders/spirv/triangle.frag.spv")).expect("Failed to load fragment shader module");
+        let layout_create_info = vk::PipelineLayoutCreateInfo::builder()
+            .set_layouts(&[]);
         let layout = unsafe { device.create_pipeline_layout(&layout_create_info, None).unwrap() };
-        let shader = load_shader_module(device, include_bytes!("shaders/spirv/gradient.comp.spv")).expect("Failed to load shader module");
-        let shader_stage_create_info = vk::PipelineShaderStageCreateInfo::builder()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(shader)
-            .name(CStr::from_bytes_with_nul(b"main\0").unwrap());
-        let compute_pipeline_create_info = vk::ComputePipelineCreateInfo::builder()
-            .stage(*shader_stage_create_info)
-            .layout(layout);
-        
-        let pipeline = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &[compute_pipeline_create_info.build()], None).unwrap()[0] };
-        (layout, pipeline, shader)
+        let pipeline_builder = PipelineBuilder {
+            layout,
+            depth_stencil: *vk::PipelineDepthStencilStateCreateInfo::builder()
+                .depth_test_enable(false)
+                .depth_write_enable(false)
+                .depth_compare_op(vk::CompareOp::NEVER)
+                .depth_bounds_test_enable(false)
+                .stencil_test_enable(false)
+                .front(Default::default())
+                .back(Default::default())
+                .min_depth_bounds(0.0)
+                .max_depth_bounds(1.0),
+            render_info: *vk::PipelineRenderingCreateInfo::builder().color_attachment_formats(&[Self::SWAPCHAIN_IMAGE_FORMAT]).depth_attachment_format(vk::Format::UNDEFINED),
+            shader_stages: vec![
+                vk::PipelineShaderStageCreateInfo::builder()
+                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .module(vertex_shader)
+                    .name(CStr::from_bytes_with_nul(b"main\0").unwrap())
+                    .build(),
+                vk::PipelineShaderStageCreateInfo::builder()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(fragment_shader)
+                    .name(CStr::from_bytes_with_nul(b"main\0").unwrap())
+                    .build(),
+            ],
+            input_assembly: *vk::PipelineInputAssemblyStateCreateInfo::builder()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
+            rasterization: *vk::PipelineRasterizationStateCreateInfo::builder()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .cull_mode(vk::CullModeFlags::NONE)
+                .front_face(vk::FrontFace::CLOCKWISE)
+                .line_width(1.0),
+            color_blend_attachment: *PipelineColorBlendAttachmentState::builder()
+                .blend_enable(false)
+                .color_write_mask(vk::ColorComponentFlags::RGBA),
+            multisample: *vk::PipelineMultisampleStateCreateInfo::builder()
+                .sample_shading_enable(false)
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+                .min_sample_shading(1.0)
+                .alpha_to_coverage_enable(false)
+                .alpha_to_one_enable(false),
+            color_attachment_format: Self::SWAPCHAIN_IMAGE_FORMAT,
+        };
+
+        let pipeline = pipeline_builder.build(device);
+        (layout, pipeline, vertex_shader, fragment_shader)
     }
 }
 
@@ -540,9 +614,10 @@ impl Drop for App {
         unsafe {
             self.device.device_wait_idle().unwrap();
             self.main_deletion_queue.flush();
-            self.device.destroy_shader_module(self.gradient_shader, None);
-            self.device.destroy_pipeline_layout(self.gradient_pipeline_layout, None);
-            self.device.destroy_pipeline(self.gradient_pipeline, None);
+            self.device.destroy_shader_module(self.frag_shader, None);
+            self.device.destroy_shader_module(self.vertex_shader, None);
+            self.device.destroy_pipeline_layout(self.triangle_pipeline_layout, None);
+            self.device.destroy_pipeline(self.triangle_pipeline, None);
             
             for frame in self.frames.iter() {
                 self.device.destroy_command_pool(frame.command_pool, None);
