@@ -2,22 +2,22 @@ mod util;
 
 use ash::extensions::khr::{Surface, Swapchain};
 
-use ash::{Device, Instance, vk};
+use crate::util::{AllocUsage, AllocatedImage, Allocator, DeletionQueue, DescriptorAllocator, DescriptorLayoutBuilder, PoolSizeRatio, load_shader_module};
+use ash::vk::{CommandBuffer, DescriptorSet, DescriptorSetLayout, Image, ImageView, Pipeline, PipelineLayout, ShaderModule, SwapchainKHR};
+use ash::{vk, Device, Instance};
+use gpu_alloc::GpuAllocator;
+use gpu_alloc_ash::device_properties;
+use log::{debug, info};
 use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 use std::error::Error;
 use std::ffi::CStr;
-use ash::vk::{CommandBuffer, Image, ImageView, SwapchainKHR};
-use gpu_alloc::GpuAllocator;
-use gpu_alloc_ash::{device_properties};
-use log::{debug, info};
+use util::FrameData;
 use winit::{
     dpi::PhysicalSize,
     event::{Event, VirtualKeyCode, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
-use util::FrameData;
-use crate::util::{AllocatedImage, Allocator, AllocUsage, DeletionQueue};
 
 const FRAME_OVERLAP: usize = 2;
 
@@ -39,6 +39,12 @@ struct App {
     allocator: Allocator,
     main_deletion_queue: DeletionQueue,
     draw_image: AllocatedImage,
+    descriptor_allocator: DescriptorAllocator,
+    draw_image_descriptor_set: vk::DescriptorSet,
+    draw_image_descriptor_set_layout: vk::DescriptorSetLayout,
+    gradient_pipeline: vk::Pipeline,
+    gradient_pipeline_layout: vk::PipelineLayout,
+    gradient_shader: ShaderModule,
 }
 
 impl App {
@@ -46,12 +52,11 @@ impl App {
     const HEIGHT: u32 = 600;
     const SWAPCHAIN_IMAGE_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
     const API_VERSION: u32 = vk::make_api_version(0, 1, 3, 0);
-    
+
     fn new(event_loop: &EventLoop<()>) -> Result<Self, Box<dyn Error>> {
         let (instance, surface_khr, surface, entry, window) = unsafe {
             let entry = ash::Entry::load()?;
-            let surface_extensions =
-                ash_window::enumerate_required_extensions(event_loop.raw_display_handle())?;
+            let surface_extensions = ash_window::enumerate_required_extensions(event_loop.raw_display_handle())?;
             let app_desc = vk::ApplicationInfo::builder().api_version(Self::API_VERSION);
             let instance_desc = vk::InstanceCreateInfo::builder()
                 .application_info(&app_desc)
@@ -65,29 +70,24 @@ impl App {
                 .build(event_loop)?;
 
             // Create a surface from winit window.
-            let surface_khr = ash_window::create_surface(
-                &entry,
-                &instance,
-                window.raw_display_handle(),
-                window.raw_window_handle(),
-                None,
-            )?;
+            let surface_khr = ash_window::create_surface(&entry, &instance, window.raw_display_handle(), window.raw_window_handle(), None)?;
             let surface = Surface::new(&entry, &instance);
             (instance, surface_khr, surface, entry, window)
         };
         let physical_device = Self::pick_physical_device(&instance, &surface, surface_khr);
         let (device, graphics_queue, present_queue) =
             Self::create_logical_device_and_queue(&instance, &surface, surface_khr, physical_device);
-        
+
         let config = gpu_alloc::Config::i_am_prototyping();
         let device_properties = unsafe { device_properties(&instance, Self::API_VERSION, physical_device)? };
         let mut allocator = GpuAllocator::new(config, device_properties);
-        
+
         let capabilities = unsafe { surface.get_physical_device_surface_capabilities(physical_device, surface_khr) }?;
         let ((swapchain, swapchain_khr), swapchain_images, swapchain_views, draw_image) =
             Self::create_swapchain(&instance, &device, surface_khr, capabilities, &mut allocator);
         let frames = Self::init_commands(graphics_queue.1, &device);
-        
+        let (descriptor_allocator, draw_image_descriptor_set_layout, draw_image_descriptor_set) = Self::init_descriptors(&device, draw_image.view);
+        let (gradient_pipeline_layout, gradient_pipeline, gradient_shader) = Self::init_pipelines(&device, draw_image_descriptor_set_layout);
         
         Ok(App {
             entry,
@@ -106,16 +106,18 @@ impl App {
             window,
             allocator,
             main_deletion_queue: DeletionQueue::default(),
-            draw_image
+            draw_image,
+            descriptor_allocator,
+            draw_image_descriptor_set,
+            draw_image_descriptor_set_layout,
+            gradient_pipeline_layout,
+            gradient_pipeline,
+            gradient_shader,
         })
     }
 
     /// Pick the first physical device that supports graphics and presentation queue families.
-    fn pick_physical_device(
-        instance: &Instance,
-        surface: &Surface,
-        surface_khr: vk::SurfaceKHR,
-    ) -> vk::PhysicalDevice {
+    fn pick_physical_device(instance: &Instance, surface: &Surface, surface_khr: vk::SurfaceKHR) -> vk::PhysicalDevice {
         let devices = unsafe { instance.enumerate_physical_devices().unwrap() };
         let device = devices
             .into_iter()
@@ -129,12 +131,7 @@ impl App {
         device
     }
 
-    fn is_device_suitable(
-        instance: &Instance,
-        surface: &Surface,
-        surface_khr: vk::SurfaceKHR,
-        device: vk::PhysicalDevice,
-    ) -> bool {
+    fn is_device_suitable(instance: &Instance, surface: &Surface, surface_khr: vk::SurfaceKHR, device: vk::PhysicalDevice) -> bool {
         let (graphics, present) = Self::find_queue_families(instance, surface, surface_khr, device);
         graphics.is_some() && present.is_some()
     }
@@ -199,8 +196,14 @@ impl App {
         };
 
         let device_features = vk::PhysicalDeviceFeatures::builder().build();
-        let mut vk12_features = vk::PhysicalDeviceVulkan12Features::builder().buffer_device_address(true).descriptor_indexing(true).build();
-        let mut vk13_features = vk::PhysicalDeviceVulkan13Features::builder().synchronization2(true).dynamic_rendering(true).build();
+        let mut vk12_features = vk::PhysicalDeviceVulkan12Features::builder()
+            .buffer_device_address(true)
+            .descriptor_indexing(true)
+            .build();
+        let mut vk13_features = vk::PhysicalDeviceVulkan13Features::builder()
+            .synchronization2(true)
+            .dynamic_rendering(true)
+            .build();
 
         let binding = [Swapchain::name().as_ptr()];
         let mut device_create_info_builder = vk::DeviceCreateInfo::builder()
@@ -238,13 +241,16 @@ impl App {
             surface: surface_khr,
             image_format: Self::SWAPCHAIN_IMAGE_FORMAT,
             present_mode: vk::PresentModeKHR::FIFO, // hard vsync
-            image_extent: vk::Extent2D { width: Self::WIDTH, height: Self::HEIGHT },
+            image_extent: vk::Extent2D {
+                width: Self::WIDTH,
+                height: Self::HEIGHT,
+            },
             image_usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT,
             pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
             composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
             image_array_layers: 1,
             min_image_count: capabilities.min_image_count,
-            
+
             ..Default::default()
         };
         let swapchain = Swapchain::new(instance, device);
@@ -275,7 +281,7 @@ impl App {
                 unsafe { device.create_image_view(&create_info, None).unwrap() }
             })
             .collect::<Vec<_>>();
-        
+
         let draw_image = AllocatedImage::new(
             device.clone(),
             allocator,
@@ -285,10 +291,12 @@ impl App {
                 depth: 1,
             },
             Self::SWAPCHAIN_IMAGE_FORMAT,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT,
             AllocUsage::GpuOnly,
         );
-        
 
         ((swapchain, swapchain_khr), images, image_views, draw_image)
     }
@@ -330,7 +338,7 @@ impl App {
     fn current_frame(&self) -> &FrameData {
         &self.frames[(self.current_frame % FRAME_OVERLAP as u32) as usize]
     }
-    
+
     fn current_frame_mut(&mut self) -> &mut FrameData {
         &mut self.frames[(self.current_frame % FRAME_OVERLAP as u32) as usize]
     }
@@ -338,15 +346,22 @@ impl App {
     fn draw(&mut self) {
         unsafe {
             // wait until GPU has finished rendering the last frame, with a timeout of 1
-            self.device.wait_for_fences(&[self.current_frame().render_fence], true, 1000000000).unwrap();
+            self.device
+                .wait_for_fences(&[self.current_frame().render_fence], true, 1000000000)
+                .unwrap();
             self.current_frame_mut().deletion_queue.flush();
             self.device.reset_fences(&[self.current_frame().render_fence]).unwrap();
-            
+
             // acquire the next image
             let (image_index, _) = self
                 .swapchain
                 .0
-                .acquire_next_image(self.swapchain.1, 1000000000, self.current_frame().swapchain_semaphore, vk::Fence::null())
+                .acquire_next_image(
+                    self.swapchain.1,
+                    1000000000,
+                    self.current_frame().swapchain_semaphore,
+                    vk::Fence::null(),
+                )
                 .unwrap();
             let cmd_buffer = self.current_frame().command_buffer;
             self.device
@@ -356,7 +371,7 @@ impl App {
             //begin command buffer recording
             let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.device.begin_command_buffer(cmd_buffer, &begin_info).unwrap();
-            
+
             // transition draw image into writable mode before rendering. undefined = we don't care, we're fine with the GPU destroying the image. general = general purpose layout which allows reading and writing from the image.
             util::transition_image(
                 &self.device,
@@ -406,52 +421,117 @@ impl App {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::ImageLayout::PRESENT_SRC_KHR,
             );
-            
+
             self.device.end_command_buffer(cmd_buffer).unwrap();
 
             // submit command buffer to queue
             let cmd_buffer_submit_info = vk::CommandBufferSubmitInfo::builder().command_buffer(cmd_buffer);
             // we want to wait on the swapchain semaphore, as that signals when the swapchain image is available for rendering
-            let wait_info = vk::SemaphoreSubmitInfo::builder().semaphore(self.current_frame().swapchain_semaphore).stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
+            let wait_info = vk::SemaphoreSubmitInfo::builder()
+                .semaphore(self.current_frame().swapchain_semaphore)
+                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
             // we want to signal the render semaphore, as that signals when the rendering is done
-            let signal_info = vk::SemaphoreSubmitInfo::builder().semaphore(self.current_frame().render_semaphore).stage_mask(vk::PipelineStageFlags2::ALL_GRAPHICS);
+            let signal_info = vk::SemaphoreSubmitInfo::builder()
+                .semaphore(self.current_frame().render_semaphore)
+                .stage_mask(vk::PipelineStageFlags2::ALL_GRAPHICS);
             let submit = vk::SubmitInfo2::builder()
                 .command_buffer_infos(&[*cmd_buffer_submit_info])
                 .wait_semaphore_infos(&[*wait_info])
                 .signal_semaphore_infos(&[*signal_info])
                 .build();
-            self.device.queue_submit2(self.graphics_queue.0, &[submit], self.current_frame().render_fence).unwrap();
+            self.device
+                .queue_submit2(self.graphics_queue.0, &[submit], self.current_frame().render_fence)
+                .unwrap();
 
             // present the image
             let swapchains = [self.swapchain.1];
             let indices = [image_index];
             let semaphores = [self.current_frame().render_semaphore];
-            let present_info = vk::PresentInfoKHR::builder().swapchains(&swapchains).image_indices(&indices).wait_semaphores(&semaphores);
+            let present_info = vk::PresentInfoKHR::builder()
+                .swapchains(&swapchains)
+                .image_indices(&indices)
+                .wait_semaphores(&semaphores);
             self.swapchain.0.queue_present(self.present_queue.0, &present_info).unwrap();
         }
         self.current_frame += 1;
     }
-    
+
     fn draw_background(&self, cmd: CommandBuffer) {
-        let flash = (self.current_frame as f32 / 120.0).sin().abs();
-        let clear_value = vk::ClearColorValue {
-            float32: [0.0, 0.0, flash, 1.0],
-        };
-        let clear_range = vk::ImageSubresourceRange::builder()
-            .level_count(vk::REMAINING_MIP_LEVELS)
-            .layer_count(vk::REMAINING_ARRAY_LAYERS)
-            .aspect_mask(vk::ImageAspectFlags::COLOR);
+        // let flash = (self.current_frame as f32 / 120.0).sin().abs();
+        // let clear_value = vk::ClearColorValue {
+        //     float32: [0.0, 0.0, flash, 1.0],
+        // };
+        // let clear_range = vk::ImageSubresourceRange::builder()
+        //     .level_count(vk::REMAINING_MIP_LEVELS)
+        //     .layer_count(vk::REMAINING_ARRAY_LAYERS)
+        //     .aspect_mask(vk::ImageAspectFlags::COLOR);
+        // 
+        // unsafe {
+        //     self.device.cmd_clear_color_image(
+        //         cmd,
+        //         self.draw_image.image,
+        //         vk::ImageLayout::GENERAL,
+        //         &clear_value,
+        //         &[clear_range.build()],
+        //     );
+        // }
         
         unsafe {
-            self.device.cmd_clear_color_image(
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.gradient_pipeline);
+            self.device.cmd_bind_descriptor_sets(
                 cmd,
-                self.draw_image.image,
-                vk::ImageLayout::GENERAL,
-                &clear_value,
-                &[clear_range.build()],
+                vk::PipelineBindPoint::COMPUTE,
+                self.gradient_pipeline_layout,
+                0,
+                &[self.draw_image_descriptor_set],
+                &[],
             );
+            self.device.cmd_dispatch(cmd, (Self::WIDTH as f32/ 16.0).ceil() as u32, (Self::HEIGHT as f32 / 16.0).ceil() as u32, 1);
         }
+    }
+
+    fn init_descriptors(device: &Device, draw_image: ImageView) -> (DescriptorAllocator, DescriptorSetLayout, DescriptorSet) {
+        let sizes = [PoolSizeRatio {
+            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+            ratio: 1.0,
+        }];
+        let descriptor_pool = DescriptorAllocator::new(device, 1, &sizes);
+        let builder = DescriptorLayoutBuilder::default().add_binding(0, vk::DescriptorType::STORAGE_IMAGE, vk::ShaderStageFlags::COMPUTE);
+        let layout = builder.build(device);
+        let descriptor_set = descriptor_pool.allocate(device, layout);
+        let img_info = vk::DescriptorImageInfo::builder()
+            .image_layout(vk::ImageLayout::GENERAL)
+            .image_view(draw_image)
+            .build();
+        let img_infos = [img_info];
+        let write = vk::WriteDescriptorSet::builder()
+            .dst_set(descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(&img_infos);
+        unsafe { device.update_descriptor_sets(&[write.build()], &[]) }
+        (descriptor_pool, layout, descriptor_set)
+    }
+    
+    fn init_pipelines(device: &Device, draw_image_descriptor_set_layout: vk::DescriptorSetLayout) -> (PipelineLayout, Pipeline, ShaderModule) {
+        Self::init_background_pipelines(device, draw_image_descriptor_set_layout)
+    }
+
+    fn init_background_pipelines(device: &Device, draw_image_descriptor_set_layout: vk::DescriptorSetLayout) -> (PipelineLayout, Pipeline, ShaderModule) {
+        let set_layouts = [draw_image_descriptor_set_layout];
+        let layout_create_info = vk::PipelineLayoutCreateInfo::builder().set_layouts(&set_layouts);
+        let layout = unsafe { device.create_pipeline_layout(&layout_create_info, None).unwrap() };
+        let shader = load_shader_module(device, include_bytes!("shaders/spirv/gradient.comp.spv")).expect("Failed to load shader module");
+        let shader_stage_create_info = vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader)
+            .name(CStr::from_bytes_with_nul(b"main\0").unwrap());
+        let compute_pipeline_create_info = vk::ComputePipelineCreateInfo::builder()
+            .stage(*shader_stage_create_info)
+            .layout(layout);
         
+        let pipeline = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &[compute_pipeline_create_info.build()], None).unwrap()[0] };
+        (layout, pipeline, shader)
     }
 }
 
@@ -460,6 +540,9 @@ impl Drop for App {
         unsafe {
             self.device.device_wait_idle().unwrap();
             self.main_deletion_queue.flush();
+            self.device.destroy_shader_module(self.gradient_shader, None);
+            self.device.destroy_pipeline_layout(self.gradient_pipeline_layout, None);
+            self.device.destroy_pipeline(self.gradient_pipeline, None);
             
             for frame in self.frames.iter() {
                 self.device.destroy_command_pool(frame.command_pool, None);
@@ -473,7 +556,7 @@ impl Drop for App {
             for view in self.swapchain_views.drain(..) {
                 self.device.destroy_image_view(view, None);
             }
-
+            self.surface_fn.destroy_surface(self.surface, None);
         }
     }
 }
@@ -499,9 +582,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         } => {
             *control_flow = ControlFlow::Exit;
         }
-        Event::LoopDestroyed => unsafe {
-            app.surface_fn.destroy_surface(app.surface, None);
-        },
         Event::MainEventsCleared => {
             app.window.request_redraw();
         }
@@ -511,4 +591,3 @@ fn main() -> Result<(), Box<dyn Error>> {
         _ => {}
     })
 }
-

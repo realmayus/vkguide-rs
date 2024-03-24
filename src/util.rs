@@ -1,3 +1,4 @@
+use std::error::Error;
 use ash::{Device, vk};
 use ash::vk::DeviceMemory;
 use gpu_alloc_ash::AshMemoryDevice;
@@ -125,6 +126,75 @@ impl AllocatedImage {
     }
 }
 
+#[derive(Default)]
+pub struct DescriptorLayoutBuilder {
+    bindings: Vec<vk::DescriptorSetLayoutBinding>,
+}
+
+impl DescriptorLayoutBuilder {
+    pub fn add_binding(mut self, binding: u32, descriptor_type: vk::DescriptorType, stage_flags: vk::ShaderStageFlags) -> Self {
+        self.bindings.push(vk::DescriptorSetLayoutBinding::builder()
+            .binding(binding)
+            .descriptor_type(descriptor_type)
+            .descriptor_count(1)
+            .stage_flags(stage_flags)
+            .build());
+        self
+    }
+    
+    pub fn clear(mut self) {
+        self.bindings.clear();
+    }
+
+    pub fn build(mut self, device: &Device) -> vk::DescriptorSetLayout {
+        
+        let info = vk::DescriptorSetLayoutCreateInfo::builder()
+            .bindings(&self.bindings);
+        unsafe { device.create_descriptor_set_layout(&info, None) }.unwrap()
+    }
+}
+
+pub struct PoolSizeRatio {
+    pub(crate) descriptor_type: vk::DescriptorType,
+    pub(crate) ratio: f32,
+}
+pub struct DescriptorAllocator {
+    pool: vk::DescriptorPool,
+}
+impl DescriptorAllocator {
+    pub fn new(device: &Device, max_sets: u32, pool_sizes: &[PoolSizeRatio]) -> Self {
+        let pool_sizes: Vec<vk::DescriptorPoolSize> = pool_sizes.iter().map(|pool_size| {
+            vk::DescriptorPoolSize {
+                ty: pool_size.descriptor_type,
+                descriptor_count: (max_sets as f32 * pool_size.ratio).ceil() as u32,
+            }
+        }).collect();
+        let info = vk::DescriptorPoolCreateInfo::builder()
+            .max_sets(max_sets)
+            .pool_sizes(&pool_sizes);
+        let pool = unsafe { device.create_descriptor_pool(&info, None) }.unwrap();
+        Self {
+            pool,
+        }
+    }
+    
+    pub fn clear_descriptors(&self, device: &Device) {
+        unsafe { device.reset_descriptor_pool(self.pool, vk::DescriptorPoolResetFlags::empty()).unwrap() }
+    }
+    
+    pub fn destroy(self, device: &Device) {
+        unsafe { device.destroy_descriptor_pool(self.pool, None) };
+    }
+    
+    pub fn allocate(&self, device: &Device, layout: vk::DescriptorSetLayout) -> vk::DescriptorSet {
+        let layouts = [layout];
+        let info = vk::DescriptorSetAllocateInfo::builder()
+            .descriptor_pool(self.pool)
+            .set_layouts(&layouts);
+        unsafe { device.allocate_descriptor_sets(&info).unwrap()[0] }
+    }
+}
+
 pub(crate) fn transition_image(
     device: &Device,
     cmd: vk::CommandBuffer,
@@ -192,4 +262,17 @@ pub(crate) fn copy_image_to_image(device: &Device, cmd: vk::CommandBuffer, sourc
         .regions(&regions);
 
     unsafe { device.cmd_blit_image2(cmd, &blit_info) };
+}
+
+pub fn load_shader_module(device: &Device, code: &[u8]) -> Result<vk::ShaderModule, Box<dyn Error>> {
+    // copy vec<u8> into vec<u32> where each u32 is a 4 byte chunk of u8s
+    let code: Vec<u32> = code.chunks(4).map(|chunk| {
+        let mut bytes = [0u8; 4];
+        for (i, byte) in chunk.iter().enumerate() {
+            bytes[i] = *byte;
+        }
+        u32::from_ne_bytes(bytes)
+    }).collect();
+    let info = vk::ShaderModuleCreateInfo::builder().code(&code);
+    unsafe { Ok(device.create_shader_module(&info, None)?) }
 }
