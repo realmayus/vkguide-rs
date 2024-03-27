@@ -14,6 +14,7 @@ gpu-alloc = "0.6.0"
 gpu-alloc-ash = "0.6.0"
 log = "0.4.21"
 env_logger = "0.11.3"
+bytemuck = { version = "1.15.0" , features = ["derive"]}
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 raw-window-metal = "0.3"

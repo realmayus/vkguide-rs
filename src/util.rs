@@ -1,11 +1,6 @@
 use std::error::Error;
 use ash::{Device, vk};
-use ash::vk::DeviceMemory;
-use gpu_alloc_ash::AshMemoryDevice;
-use log::log;
 
-pub type Allocation = gpu_alloc::MemoryBlock<DeviceMemory>;
-pub type Allocator = gpu_alloc::GpuAllocator<DeviceMemory>;
 
 pub struct FrameData {
     pub(crate) command_pool: vk::CommandPool,
@@ -29,100 +24,6 @@ impl DeletionQueue {
         for deleter in self.deletors.drain(..) {
             deleter();
         }
-    }
-}
-
-pub enum AllocUsage {
-    GpuOnly,
-    Shared,
-    UploadToHost,
-}
-
-impl AllocUsage {
-    pub fn flags(&self) -> gpu_alloc::UsageFlags {
-        match self {
-            AllocUsage::GpuOnly => gpu_alloc::UsageFlags::FAST_DEVICE_ACCESS,
-            AllocUsage::Shared => gpu_alloc::UsageFlags::HOST_ACCESS | gpu_alloc::UsageFlags::FAST_DEVICE_ACCESS | gpu_alloc::UsageFlags::DOWNLOAD | gpu_alloc::UsageFlags::UPLOAD,
-            AllocUsage::UploadToHost => gpu_alloc::UsageFlags::DOWNLOAD | gpu_alloc::UsageFlags::UPLOAD
-        }
-    }
-}
-
-pub struct AllocatedImage {
-    pub image: vk::Image,
-    pub view: vk::ImageView,
-    allocation: Allocation,
-    pub extent: vk::Extent3D,
-    format: vk::Format,
-}
-
-impl AllocatedImage {
-    pub fn new(
-        device: Device,
-        allocator: &mut Allocator,
-        extent: vk::Extent3D,
-        format: vk::Format,
-        image_usages: vk::ImageUsageFlags,
-        alloc_usages: AllocUsage,
-    ) -> Self {
-        let info = vk::ImageCreateInfo::builder()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(extent)
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(image_usages)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let image = unsafe { device.create_image(&info, None) }.unwrap();
-        let reqs = unsafe { device.get_image_memory_requirements(image) };
-        let allocation = unsafe {
-            allocator.alloc(
-                AshMemoryDevice::wrap(&device),
-                gpu_alloc::Request {
-                    size: reqs.size,
-                    align_mask: reqs.alignment - 1,
-                    usage: alloc_usages.flags(),
-                    memory_types: reqs.memory_type_bits,
-                },
-            ).unwrap()
-        };
-        log::info!("Creating image {:?} of size {:?} and format {:?}", image, extent, format);
-        unsafe { device.bind_image_memory(image, *allocation.memory(), allocation.offset()).unwrap() };
-
-        let view_create_info = vk::ImageViewCreateInfo::builder()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(format)
-            .components(vk::ComponentMapping::builder()
-                .r(vk::ComponentSwizzle::IDENTITY)
-                .g(vk::ComponentSwizzle::IDENTITY)
-                .b(vk::ComponentSwizzle::IDENTITY)
-                .a(vk::ComponentSwizzle::IDENTITY)
-                .build())
-            .subresource_range(vk::ImageSubresourceRange::builder()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .base_mip_level(0)
-                .level_count(1)
-                .base_array_layer(0)
-                .layer_count(1)
-                .build());
-        let view  = unsafe { device.create_image_view(&view_create_info, None).unwrap() };
-        Self {
-            image,
-            view,
-            allocation,
-            extent,
-            format,
-        }
-    }
-
-    pub fn destroy(self, device: &Device, allocator: &mut Allocator) {
-        log::info!("Destroying image {:?} of size {:?} and format {:?}", self.image, self.extent, self.format);
-        unsafe { device.destroy_image_view(self.view, None) };
-        unsafe { device.destroy_image(self.image, None) };
-        unsafe { allocator.dealloc(AshMemoryDevice::wrap(device), self.allocation) };
     }
 }
 
@@ -153,88 +54,58 @@ impl DescriptorLayoutBuilder {
         unsafe { device.create_descriptor_set_layout(&info, None) }.unwrap()
     }
 }
+pub mod device_discovery {
+    use std::ffi::CStr;
+    use ash::extensions::khr::Surface;
+    use ash::{Instance, vk};
+    use log::info;
 
-pub struct PoolSizeRatio {
-    pub(crate) descriptor_type: vk::DescriptorType,
-    pub(crate) ratio: f32,
-}
-pub struct DescriptorAllocator {
-    pool: vk::DescriptorPool,
-}
-impl DescriptorAllocator {
-    pub fn new(device: &Device, max_sets: u32, pool_sizes: &[PoolSizeRatio]) -> Self {
-        let pool_sizes: Vec<vk::DescriptorPoolSize> = pool_sizes.iter().map(|pool_size| {
-            vk::DescriptorPoolSize {
-                ty: pool_size.descriptor_type,
-                descriptor_count: (max_sets as f32 * pool_size.ratio).ceil() as u32,
+    pub(crate) fn pick_physical_device(instance: &Instance, surface: &Surface, surface_khr: vk::SurfaceKHR) -> vk::PhysicalDevice {
+        let devices = unsafe { instance.enumerate_physical_devices().unwrap() };
+        let device = devices
+            .into_iter()
+            .find(|device| is_device_suitable(instance, surface, surface_khr, *device))
+            .expect("No suitable physical device.");
+
+        let props = unsafe { instance.get_physical_device_properties(device) };
+        info!("Selected physical device: {:?}", unsafe {
+            CStr::from_ptr(props.device_name.as_ptr())
+        });
+        device
+    }
+
+    fn is_device_suitable(instance: &Instance, surface: &Surface, surface_khr: vk::SurfaceKHR, device: vk::PhysicalDevice) -> bool {
+        let (graphics, present) = find_queue_families(instance, surface, surface_khr, device);
+        graphics.is_some() && present.is_some()
+    }
+    pub(crate) fn find_queue_families(
+        instance: &Instance,
+        surface: &Surface,
+        surface_khr: vk::SurfaceKHR,
+        device: vk::PhysicalDevice,
+    ) -> (Option<u32>, Option<u32>) {
+        let mut graphics = None;
+        let mut present = None;
+
+        let props = unsafe { instance.get_physical_device_queue_family_properties(device) };
+        for (index, family) in props.iter().filter(|f| f.queue_count > 0).enumerate() {
+            let index = index as u32;
+
+            if family.queue_flags.contains(vk::QueueFlags::GRAPHICS) && graphics.is_none() {
+                graphics = Some(index);
             }
-        }).collect();
-        let info = vk::DescriptorPoolCreateInfo::builder()
-            .max_sets(max_sets)
-            .pool_sizes(&pool_sizes);
-        let pool = unsafe { device.create_descriptor_pool(&info, None) }.unwrap();
-        Self {
-            pool,
-        }
-    }
-    
-    pub fn clear_descriptors(&self, device: &Device) {
-        unsafe { device.reset_descriptor_pool(self.pool, vk::DescriptorPoolResetFlags::empty()).unwrap() }
-    }
-    
-    pub fn destroy(self, device: &Device) {
-        unsafe { device.destroy_descriptor_pool(self.pool, None) };
-    }
-    
-    pub fn allocate(&self, device: &Device, layout: vk::DescriptorSetLayout) -> vk::DescriptorSet {
-        let layouts = [layout];
-        let info = vk::DescriptorSetAllocateInfo::builder()
-            .descriptor_pool(self.pool)
-            .set_layouts(&layouts);
-        unsafe { device.allocate_descriptor_sets(&info).unwrap()[0] }
-    }
-}
 
-pub struct PipelineBuilder {
-    pub shader_stages: Vec<vk::PipelineShaderStageCreateInfo>,
-    pub input_assembly: vk::PipelineInputAssemblyStateCreateInfo,
-    pub rasterization: vk::PipelineRasterizationStateCreateInfo,
-    pub color_blend_attachment: vk::PipelineColorBlendAttachmentState,
-    pub multisample: vk::PipelineMultisampleStateCreateInfo,
-    pub layout: vk::PipelineLayout,
-    pub depth_stencil: vk::PipelineDepthStencilStateCreateInfo,
-    pub render_info: vk::PipelineRenderingCreateInfo,
-    pub color_attachment_format: vk::Format,
-}
-impl PipelineBuilder {
-    
-    pub(crate) fn build(mut self, device: &Device) -> vk::Pipeline {
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
-            .viewport_count(1)  // dynamic state allows us to only specify count
-            .scissor_count(1);
-        let color_blend_attachments = [self.color_blend_attachment];
-        let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
-            .attachments(&color_blend_attachments)
-            .logic_op(vk::LogicOp::COPY);
-        // we don't need this as we're using dynamic state
-        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::builder();
-        let dynamic_state = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dynamic_state_info = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_state);
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
-            .stages(&self.shader_stages)
-            .vertex_input_state(&vertex_input_info)
-            .input_assembly_state(&self.input_assembly)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&self.rasterization)
-            .multisample_state(&self.multisample)
-            .color_blend_state(&color_blend_state)
-            .depth_stencil_state(&self.depth_stencil)
-            .layout(self.layout)
-            .push_next(&mut self.render_info)
-            .dynamic_state(&dynamic_state_info);
-        
-        unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[*pipeline_info], None).unwrap()[0] }
+            let present_support = unsafe { surface.get_physical_device_surface_support(device, index, surface_khr).unwrap() };
+            if present_support && present.is_none() {
+                present = Some(index);
+            }
+
+            if graphics.is_some() && present.is_some() {
+                break;
+            }
+        }
+
+        (graphics, present)
     }
 }
 
