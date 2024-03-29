@@ -32,7 +32,7 @@ impl DescriptorAllocator {
     pub fn clear_descriptors(&self, device: &Device) {
         unsafe { device.reset_descriptor_pool(self.pool, vk::DescriptorPoolResetFlags::empty()).unwrap() }
     }
-    
+
     pub fn allocate(&self, device: &Device, layout: vk::DescriptorSetLayout) -> vk::DescriptorSet {
         let layouts = [layout];
         let info = vk::DescriptorSetAllocateInfo::builder()
@@ -124,6 +124,7 @@ impl AllocatedImage {
         format: vk::Format,
         image_usages: vk::ImageUsageFlags,
         alloc_usages: AllocUsage,
+        image_aspect: vk::ImageAspectFlags,
     ) -> Self {
         let info = vk::ImageCreateInfo::builder()
             .image_type(vk::ImageType::TYPE_2D)
@@ -162,7 +163,7 @@ impl AllocatedImage {
                 .a(vk::ComponentSwizzle::IDENTITY)
                 .build())
             .subresource_range(vk::ImageSubresourceRange::builder()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .aspect_mask(image_aspect)
                 .base_mip_level(0)
                 .level_count(1)
                 .base_array_layer(0)

@@ -55,6 +55,7 @@ struct App {
     immediate_command_pool: CommandPool,
     immediate_command_buffer: CommandBuffer,
     meshes: Vec<Mesh>,
+    depth_image: Option<AllocatedImage>,
 }
 
 struct Mesh {
@@ -66,6 +67,7 @@ struct Mesh {
 
 impl App {
     const SWAPCHAIN_IMAGE_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
+    const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
     const API_VERSION: u32 = vk::make_api_version(0, 1, 3, 0);
 
     fn new(event_loop: &EventLoop<()>) -> Result<Self, Box<dyn Error>> {
@@ -100,7 +102,7 @@ impl App {
         let mut allocator = GpuAllocator::new(config, device_properties);
 
         let capabilities = unsafe { surface.get_physical_device_surface_capabilities(physical_device, surface_khr) }?;
-        let ((swapchain, swapchain_khr), swapchain_images, swapchain_views, draw_image) =
+        let ((swapchain, swapchain_khr), swapchain_images, swapchain_views, draw_image, depth_image) =
             Self::create_swapchain(&instance, &device, surface_khr, capabilities, &mut allocator, window_size);
         let (immediate_command_pool, immediate_command_buffer, immediate_fence, frames) = Self::init_commands(graphics_queue.1, &device, &mut deletion_queue);
         let (descriptor_allocator, draw_image_descriptor_set_layout, draw_image_descriptor_set) =
@@ -127,6 +129,7 @@ impl App {
             allocator,
             main_deletion_queue: deletion_queue,
             draw_image: Some(draw_image),
+            depth_image: Some(depth_image),
             descriptor_allocator,
             draw_image_descriptor_set,
             draw_image_descriptor_set_layout,
@@ -215,7 +218,7 @@ impl App {
         capabilities: vk::SurfaceCapabilitiesKHR,
         allocator: &mut Allocator,
         window_size: (u32, u32),
-    ) -> ((Swapchain, vk::SwapchainKHR), Vec<vk::Image>, Vec<vk::ImageView>, AllocatedImage) {
+    ) -> ((Swapchain, vk::SwapchainKHR), Vec<vk::Image>, Vec<vk::ImageView>, AllocatedImage, AllocatedImage) {
         let create_info = vk::SwapchainCreateInfoKHR {
             surface: surface_khr,
             image_format: Self::SWAPCHAIN_IMAGE_FORMAT,
@@ -275,9 +278,24 @@ impl App {
                 | vk::ImageUsageFlags::STORAGE
                 | vk::ImageUsageFlags::COLOR_ATTACHMENT,
             AllocUsage::GpuOnly,
+            vk::ImageAspectFlags::COLOR,
+        );
+        
+        let depth_image = AllocatedImage::new(
+            device.clone(),
+            allocator,
+            vk::Extent3D {
+                width: window_size.0,
+                height: window_size.1,
+                depth: 1,
+            },
+            Self::DEPTH_FORMAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            AllocUsage::GpuOnly,
+            vk::ImageAspectFlags::DEPTH,
         );
 
-        ((swapchain, swapchain_khr), images, image_views, draw_image)
+        ((swapchain, swapchain_khr), images, image_views, draw_image, depth_image)
     }
 
     fn init_commands(queue_family_index: u32, device: &Device, deletion_queue: &mut DeletionQueue) -> (CommandPool, CommandBuffer, vk::Fence, [FrameData; FRAME_OVERLAP]) {
@@ -379,9 +397,9 @@ impl App {
         let pipeline_builder = PipelineBuilder {
             layout,
             depth_stencil: *vk::PipelineDepthStencilStateCreateInfo::builder()
-                .depth_test_enable(false)
-                .depth_write_enable(false)
-                .depth_compare_op(vk::CompareOp::NEVER)
+                .depth_test_enable(true)
+                .depth_write_enable(true)
+                .depth_compare_op(vk::CompareOp::GREATER_OR_EQUAL)
                 .depth_bounds_test_enable(false)
                 .stencil_test_enable(false)
                 .front(Default::default())
@@ -390,7 +408,7 @@ impl App {
                 .max_depth_bounds(1.0),
             render_info: *vk::PipelineRenderingCreateInfo::builder()
                 .color_attachment_formats(&[Self::SWAPCHAIN_IMAGE_FORMAT])
-                .depth_attachment_format(vk::Format::UNDEFINED),
+                .depth_attachment_format(Self::DEPTH_FORMAT),
             shader_stages: vec![
                 vk::PipelineShaderStageCreateInfo::builder()
                     .stage(vk::ShaderStageFlags::VERTEX)
@@ -448,15 +466,17 @@ impl App {
             self.device.device_wait_idle().unwrap();
             self.destroy_swapchain();
             self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator);
+            self.depth_image.take().unwrap().destroy(&self.device, &mut self.allocator);
         }
         self.window_size = size;
         let capabilities = unsafe { self.surface_fn.get_physical_device_surface_capabilities(self.physical_device, self.surface).unwrap() };
-        let (swapchain, swapchain_images, swapchain_views, draw_image) = 
+        let (swapchain, swapchain_images, swapchain_views, draw_image, depth_image) = 
             Self::create_swapchain(&self.instance, &self.device, self.surface, capabilities, &mut self.allocator, self.window_size);
         self.swapchain = swapchain;
         self.swapchain_images = swapchain_images;
         self.swapchain_views = swapchain_views;
         self.draw_image = Some(draw_image);
+        self.depth_image = Some(depth_image);
     }
     
     fn upload_mesh(&mut self, indices: &[u32], vertices: &[Vertex]) {
@@ -604,7 +624,14 @@ impl App {
                 vk::ImageLayout::GENERAL,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             );
-
+            util::transition_image(
+                &self.device,
+                cmd_buffer,
+                self.depth_image.as_ref().unwrap().image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            );
+            
             self.draw_geometry(cmd_buffer);
 
             // prepare copying of the draw image to the swapchain image
@@ -704,8 +731,18 @@ impl App {
             .image_view(self.draw_image.as_ref().unwrap().view)
             .image_layout(vk::ImageLayout::GENERAL);
         let color_attachments = [color_attachment.build()];
+        let depth_attachment = *vk::RenderingAttachmentInfo::builder()
+            .image_view(self.depth_image.as_ref().unwrap().view)
+            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 },
+            });
+        
         let render_info = vk::RenderingInfo::builder()
             .color_attachments(&color_attachments)
+            .depth_attachment(&depth_attachment)
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: vk::Extent2D {
@@ -763,6 +800,7 @@ impl Drop for App {
             }
             
             self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator);
+            self.depth_image.take().unwrap().destroy(&self.device, &mut self.allocator);
 
             for frame in self.frames.iter() {
                 self.device.destroy_command_pool(frame.command_pool, None);
