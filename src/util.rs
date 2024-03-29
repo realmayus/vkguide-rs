@@ -1,5 +1,6 @@
 use std::error::Error;
 use ash::{Device, vk};
+use crate::resources::{AllocatedBuffer, Allocator};
 
 
 pub struct FrameData {
@@ -13,16 +14,16 @@ pub struct FrameData {
 
 #[derive(Default)]
 pub(crate) struct DeletionQueue {
-    deletors: Vec<Box<dyn FnOnce() + Send>>,
+    deletors: Vec<Box<dyn FnOnce(&Device) + Send>>,
 }
 
 impl DeletionQueue {
-    pub(crate) fn push<T: 'static + FnOnce() + Send>(&mut self, deleter: T) {
+    pub(crate) fn push<T: 'static + FnOnce(&Device) + Send>(&mut self, deleter: T) {
         self.deletors.push(Box::new(deleter));
     }
-    pub(crate) fn flush(&mut self) {
+    pub(crate) fn flush(&mut self, device: &Device) {
         for deleter in self.deletors.drain(..) {
-            deleter();
+            deleter(device);
         }
     }
 }
@@ -47,7 +48,7 @@ impl DescriptorLayoutBuilder {
         self.bindings.clear();
     }
 
-    pub fn build(mut self, device: &Device) -> vk::DescriptorSetLayout {
+    pub fn build(self, device: &Device) -> vk::DescriptorSetLayout {
         
         let info = vk::DescriptorSetLayoutCreateInfo::builder()
             .bindings(&self.bindings);

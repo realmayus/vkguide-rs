@@ -11,7 +11,7 @@ use ash::vk::{CommandBuffer, CommandPool};
 use ash::{vk, Device, Instance};
 use gpu_alloc::GpuAllocator;
 use gpu_alloc_ash::{device_properties, AshMemoryDevice};
-use log::{debug, info};
+use log::debug;
 use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 use std::error::Error;
 use std::ffi::CStr;
@@ -42,7 +42,7 @@ struct App {
     window: winit::window::Window,
     allocator: Allocator,
     main_deletion_queue: DeletionQueue,
-    draw_image: AllocatedImage,
+    draw_image: Option<AllocatedImage>,
     descriptor_allocator: DescriptorAllocator,
     draw_image_descriptor_set: vk::DescriptorSet,
     draw_image_descriptor_set_layout: vk::DescriptorSetLayout,
@@ -90,6 +90,7 @@ impl App {
             let surface = Surface::new(&entry, &instance);
             (instance, surface_khr, surface, entry, window)
         };
+        let mut deletion_queue = DeletionQueue::default();
         let physical_device = device_discovery::pick_physical_device(&instance, &surface, surface_khr);
         let (device, graphics_queue, present_queue) =
             Self::create_logical_device_and_queue(&instance, &surface, surface_khr, physical_device);
@@ -101,11 +102,11 @@ impl App {
         let capabilities = unsafe { surface.get_physical_device_surface_capabilities(physical_device, surface_khr) }?;
         let ((swapchain, swapchain_khr), swapchain_images, swapchain_views, draw_image) =
             Self::create_swapchain(&instance, &device, surface_khr, capabilities, &mut allocator);
-        let (immediate_command_pool, immediate_command_buffer, immediate_fence, frames) = Self::init_commands(graphics_queue.1, &device);
+        let (immediate_command_pool, immediate_command_buffer, immediate_fence, frames) = Self::init_commands(graphics_queue.1, &device, &mut deletion_queue);
         let (descriptor_allocator, draw_image_descriptor_set_layout, draw_image_descriptor_set) =
-            Self::init_descriptors(&device, draw_image.view);
+            Self::init_descriptors(&device, draw_image.view, &mut deletion_queue);
         let (triangle_pipeline_layout, triangle_pipeline, vertex_shader, frag_shader) =
-            Self::init_pipelines(&device);
+            Self::init_pipelines(&device, &mut deletion_queue);
 
         Ok(App {
             entry,
@@ -123,8 +124,8 @@ impl App {
             current_frame: 0,
             window,
             allocator,
-            main_deletion_queue: DeletionQueue::default(),
-            draw_image,
+            main_deletion_queue: deletion_queue,
+            draw_image: Some(draw_image),
             descriptor_allocator,
             draw_image_descriptor_set,
             draw_image_descriptor_set_layout,
@@ -277,7 +278,7 @@ impl App {
         ((swapchain, swapchain_khr), images, image_views, draw_image)
     }
 
-    fn init_commands(queue_family_index: u32, device: &Device) -> (CommandPool, CommandBuffer, vk::Fence, [FrameData; FRAME_OVERLAP]) {
+    fn init_commands(queue_family_index: u32, device: &Device, deletion_queue: &mut DeletionQueue) -> (CommandPool, CommandBuffer, vk::Fence, [FrameData; FRAME_OVERLAP]) {
         let command_pool_create_info = vk::CommandPoolCreateInfo::builder()
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER) // we want to be able to reset individual command buffers, not the entire pool at once
             .queue_family_index(queue_family_index);
@@ -291,6 +292,12 @@ impl App {
             .command_buffer_count(1);
         let immediate_command_buffer = unsafe { device.allocate_command_buffers(&immediate_alloc_info).unwrap()[0] };
         let immediate_fence = unsafe { device.create_fence(&fence_create_info, None).unwrap() };
+        deletion_queue.push(move |device| {
+            unsafe {
+                device.destroy_command_pool(immediate_command_pool, None);
+                device.destroy_fence(immediate_fence, None);
+            }
+        });
         (
             immediate_command_pool,
             immediate_command_buffer,
@@ -323,7 +330,7 @@ impl App {
         )
     }
 
-    fn init_descriptors(device: &Device, draw_image: vk::ImageView) -> (DescriptorAllocator, vk::DescriptorSetLayout, vk::DescriptorSet) {
+    fn init_descriptors(device: &Device, draw_image: vk::ImageView, deletion_queue: &mut DeletionQueue) -> (DescriptorAllocator, vk::DescriptorSetLayout, vk::DescriptorSet) {
         let sizes = [PoolSizeRatio {
             descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
             ratio: 1.0,
@@ -343,16 +350,23 @@ impl App {
             .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
             .image_info(&img_infos);
         unsafe { device.update_descriptor_sets(&[write.build()], &[]) }
+        deletion_queue.push(move |device| {
+            unsafe {
+                device.destroy_descriptor_set_layout(layout, None);
+                device.destroy_descriptor_pool(descriptor_pool.pool, None);
+            }
+        });
         (descriptor_pool, layout, descriptor_set)
     }
 
     fn init_pipelines(
         device: &Device,
+        deletion_queue: &mut DeletionQueue,
     ) -> (vk::PipelineLayout, vk::Pipeline, vk::ShaderModule, vk::ShaderModule) {
-        Self::init_mesh_pipeline(device)
+        Self::init_mesh_pipeline(device, deletion_queue)
     }
 
-    fn init_mesh_pipeline(device: &Device) -> (vk::PipelineLayout, vk::Pipeline, vk::ShaderModule, vk::ShaderModule) {
+    fn init_mesh_pipeline(device: &Device, deletion_queue: &mut DeletionQueue) -> (vk::PipelineLayout, vk::Pipeline, vk::ShaderModule, vk::ShaderModule) {
         let vertex_shader =
             load_shader_module(device, include_bytes!("shaders/spirv/mesh.vert.spv")).expect("Failed to load vertex shader module");
         let fragment_shader =
@@ -406,6 +420,19 @@ impl App {
         };
 
         let pipeline = pipeline_builder.build(device);
+        
+        unsafe {
+            device.destroy_shader_module(vertex_shader, None);
+            device.destroy_shader_module(fragment_shader, None);
+        }
+
+        deletion_queue.push(move |device| {
+            unsafe {
+                device.destroy_pipeline_layout(layout, None);
+                device.destroy_pipeline(pipeline, None);
+            }
+        });
+        
         (layout, pipeline, vertex_shader, fragment_shader)
     }
 
@@ -428,6 +455,7 @@ impl App {
             AllocUsage::GpuOnly,
             index_buffer_size,
         );
+
 
         let mut staging = AllocatedBuffer::new(
             &self.device,
@@ -479,6 +507,7 @@ impl App {
     fn immediate_submit(&mut self, cmd: Box<dyn Fn(&mut Self, CommandBuffer)>) {
         let cmd_buffer = self.immediate_command_buffer;
         unsafe {
+            self.device.reset_fences(&[self.immediate_fence]).unwrap();
             self.device
                 .reset_command_buffer(cmd_buffer, vk::CommandBufferResetFlags::empty())
                 .unwrap();
@@ -510,7 +539,8 @@ impl App {
             self.device
                 .wait_for_fences(&[self.current_frame().render_fence], true, 1000000000)
                 .unwrap();
-            self.current_frame_mut().deletion_queue.flush();
+            let device = self.device.clone();
+            self.current_frame_mut().deletion_queue.flush(&device);
             self.device.reset_fences(&[self.current_frame().render_fence]).unwrap();
 
             // acquire the next image
@@ -537,7 +567,7 @@ impl App {
             util::transition_image(
                 &self.device,
                 cmd_buffer,
-                self.draw_image.image,
+                self.draw_image.as_ref().unwrap().image,
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::GENERAL,
             );
@@ -547,7 +577,7 @@ impl App {
             util::transition_image(
                 &self.device,
                 cmd_buffer,
-                self.draw_image.image,
+                self.draw_image.as_ref().unwrap().image,
                 vk::ImageLayout::GENERAL,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             );
@@ -558,7 +588,7 @@ impl App {
             util::transition_image(
                 &self.device,
                 cmd_buffer,
-                self.draw_image.image,
+                self.draw_image.as_ref().unwrap().image,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             );
@@ -573,11 +603,11 @@ impl App {
             util::copy_image_to_image(
                 &self.device,
                 cmd_buffer,
-                self.draw_image.image,
+                self.draw_image.as_ref().unwrap().image,
                 self.swapchain_images[image_index as usize],
                 vk::Extent2D {
-                    width: self.draw_image.extent.width,
-                    height: self.draw_image.extent.height,
+                    width: self.draw_image.as_ref().unwrap().extent.width,
+                    height: self.draw_image.as_ref().unwrap().extent.height,
                 },
                 vk::Extent2D {
                     width: Self::WIDTH,
@@ -628,10 +658,6 @@ impl App {
     }
 
     fn draw_background(&self, cmd: vk::CommandBuffer) {
-        let flash = (self.current_frame as f32 / 120.0).sin().abs();
-        let clear_value = vk::ClearColorValue {
-            float32: [0.0, 0.0, flash, 1.0],
-        };
         let clear_range = vk::ImageSubresourceRange::builder()
             .level_count(vk::REMAINING_MIP_LEVELS)
             .layer_count(vk::REMAINING_ARRAY_LAYERS)
@@ -640,9 +666,11 @@ impl App {
         unsafe {
             self.device.cmd_clear_color_image(
                 cmd,
-                self.draw_image.image,
+                self.draw_image.as_ref().unwrap().image,
                 vk::ImageLayout::GENERAL,
-                &clear_value,
+                &vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 1.0],
+                },
                 &[clear_range.build()],
             );
         }
@@ -650,7 +678,7 @@ impl App {
 
     fn draw_geometry(&self, cmd: vk::CommandBuffer) {
         let color_attachment = vk::RenderingAttachmentInfo::builder()
-            .image_view(self.draw_image.view)
+            .image_view(self.draw_image.as_ref().unwrap().view)
             .image_layout(vk::ImageLayout::GENERAL);
         let color_attachments = [color_attachment.build()];
         let render_info = vk::RenderingInfo::builder()
@@ -705,11 +733,13 @@ impl Drop for App {
     fn drop(&mut self) {
         unsafe {
             self.device.device_wait_idle().unwrap();
-            self.main_deletion_queue.flush();
-            self.device.destroy_shader_module(self.frag_shader, None);
-            self.device.destroy_shader_module(self.vertex_shader, None);
-            self.device.destroy_pipeline_layout(self.triangle_pipeline_layout, None);
-            self.device.destroy_pipeline(self.triangle_pipeline, None);
+            self.main_deletion_queue.flush(&self.device);
+            for mesh in self.meshes.drain(..) {
+                mesh.index_buffer.destroy(&self.device, &mut self.allocator);
+                mesh.vertex_buffer.destroy(&self.device, &mut self.allocator);
+            }
+            
+            self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator);
 
             for frame in self.frames.iter() {
                 self.device.destroy_command_pool(frame.command_pool, None);
@@ -717,13 +747,13 @@ impl Drop for App {
                 self.device.destroy_semaphore(frame.swapchain_semaphore, None);
                 self.device.destroy_semaphore(frame.render_semaphore, None);
             }
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
             self.swapchain.0.destroy_swapchain(self.swapchain.1, None);
             for view in self.swapchain_views.drain(..) {
                 self.device.destroy_image_view(view, None);
             }
+            self.device.destroy_device(None);
             self.surface_fn.destroy_surface(self.surface, None);
+            self.instance.destroy_instance(None);
         }
     }
 }
@@ -763,7 +793,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             uv_y: 0.0,
         }
     ];
-    
+
     let indices = [0, 1, 2, 2, 1, 3];
     app.upload_mesh(&indices, &vertices);
     event_loop.run(move |event, _, control_flow| match event {
@@ -785,7 +815,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Event::MainEventsCleared => {
             app.window.request_redraw();
         }
-        Event::RedrawRequested(id) => {
+        Event::RedrawRequested(..) => {
             app.draw();
         }
         _ => {}

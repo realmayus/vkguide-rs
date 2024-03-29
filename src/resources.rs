@@ -1,5 +1,5 @@
 use ash::{Device, vk};
-use ash::vk::{BufferCreateFlags, DeviceMemory, DeviceSize};
+use ash::vk::{DeviceMemory, DeviceSize};
 use gpu_alloc_ash::AshMemoryDevice;
 
 pub type Allocation = gpu_alloc::MemoryBlock<DeviceMemory>;
@@ -10,7 +10,7 @@ pub struct PoolSizeRatio {
     pub(crate) ratio: f32,
 }
 pub struct DescriptorAllocator {
-    pool: vk::DescriptorPool,
+    pub(crate) pool: vk::DescriptorPool,
 }
 impl DescriptorAllocator {
     pub fn new(device: &Device, max_sets: u32, pool_sizes: &[PoolSizeRatio]) -> Self {
@@ -32,11 +32,7 @@ impl DescriptorAllocator {
     pub fn clear_descriptors(&self, device: &Device) {
         unsafe { device.reset_descriptor_pool(self.pool, vk::DescriptorPoolResetFlags::empty()).unwrap() }
     }
-
-    pub fn destroy(self, device: &Device) {
-        unsafe { device.destroy_descriptor_pool(self.pool, None) };
-    }
-
+    
     pub fn allocate(&self, device: &Device, layout: vk::DescriptorSetLayout) -> vk::DescriptorSet {
         let layouts = [layout];
         let info = vk::DescriptorSetAllocateInfo::builder()
