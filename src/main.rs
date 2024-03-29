@@ -4,7 +4,7 @@ mod util;
 
 use ash::extensions::khr::{Surface, Swapchain};
 
-use crate::pipeline::{PipelineBuilder, Vertex};
+use crate::pipeline::{PipelineBuilder, PushConstants, Vertex};
 use crate::resources::{AllocUsage, AllocatedBuffer, AllocatedImage, Allocator, DescriptorAllocator, PoolSizeRatio};
 use crate::util::{device_discovery, load_shader_module, DeletionQueue, DescriptorLayoutBuilder};
 use ash::vk::{CommandBuffer, CommandPool};
@@ -51,10 +51,17 @@ struct App {
     vertex_shader: vk::ShaderModule,
     frag_shader: vk::ShaderModule,
     immediate_fence: vk::Fence,
-    immediate_buffer: vk::CommandBuffer,
     immediate_command_pool: CommandPool,
     immediate_command_buffer: CommandBuffer,
+    meshes: Vec<Mesh>,
 }
+
+struct Mesh {
+    index_buffer: AllocatedBuffer,
+    vertex_buffer: AllocatedBuffer,
+    vertex_address: vk::DeviceAddress,
+}
+
 
 impl App {
     const WIDTH: u32 = 800;
@@ -98,7 +105,7 @@ impl App {
         let (descriptor_allocator, draw_image_descriptor_set_layout, draw_image_descriptor_set) =
             Self::init_descriptors(&device, draw_image.view);
         let (triangle_pipeline_layout, triangle_pipeline, vertex_shader, frag_shader) =
-            Self::init_pipelines(&device, draw_image_descriptor_set_layout);
+            Self::init_pipelines(&device);
 
         Ok(App {
             entry,
@@ -127,7 +134,8 @@ impl App {
             triangle_pipeline,
             immediate_command_pool,
             immediate_command_buffer, 
-            immediate_fence
+            immediate_fence,
+            meshes: Vec::new(),
         })
     }
 
@@ -340,17 +348,17 @@ impl App {
 
     fn init_pipelines(
         device: &Device,
-        draw_image_descriptor_set_layout: vk::DescriptorSetLayout,
     ) -> (vk::PipelineLayout, vk::Pipeline, vk::ShaderModule, vk::ShaderModule) {
-        Self::init_triangle_pipeline(device)
+        Self::init_mesh_pipeline(device)
     }
 
-    fn init_triangle_pipeline(device: &Device) -> (vk::PipelineLayout, vk::Pipeline, vk::ShaderModule, vk::ShaderModule) {
+    fn init_mesh_pipeline(device: &Device) -> (vk::PipelineLayout, vk::Pipeline, vk::ShaderModule, vk::ShaderModule) {
         let vertex_shader =
-            load_shader_module(device, include_bytes!("shaders/spirv/triangle.vert.spv")).expect("Failed to load vertex shader module");
+            load_shader_module(device, include_bytes!("shaders/spirv/mesh.vert.spv")).expect("Failed to load vertex shader module");
         let fragment_shader =
-            load_shader_module(device, include_bytes!("shaders/spirv/triangle.frag.spv")).expect("Failed to load fragment shader module");
-        let layout_create_info = vk::PipelineLayoutCreateInfo::builder().set_layouts(&[]);
+            load_shader_module(device, include_bytes!("shaders/spirv/mesh.frag.spv")).expect("Failed to load fragment shader module");
+        let push_constant_range = [*vk::PushConstantRange::builder().offset(0).size(std::mem::size_of::<PushConstants>() as u32).stage_flags(vk::ShaderStageFlags::VERTEX)];
+        let layout_create_info = vk::PipelineLayoutCreateInfo::builder().set_layouts(&[]).push_constant_ranges(&push_constant_range);
         let layout = unsafe { device.create_pipeline_layout(&layout_create_info, None).unwrap() };
         let pipeline_builder = PipelineBuilder {
             layout,
@@ -401,7 +409,7 @@ impl App {
         (layout, pipeline, vertex_shader, fragment_shader)
     }
 
-    fn upload_mesh(&mut self, indices: &[u32], vertices: &[Vertex]) -> (AllocatedBuffer, vk::DeviceAddress, AllocatedBuffer) {
+    fn upload_mesh(&mut self, indices: &[u32], vertices: &[Vertex]) {
         let vertex_buffer_size = (vertices.len() * std::mem::size_of::<Vertex>()) as vk::DeviceSize;
         let index_buffer_size = (indices.len() * std::mem::size_of::<u32>()) as vk::DeviceSize;
         let vertex_buffer = AllocatedBuffer::new(
@@ -412,7 +420,7 @@ impl App {
             vertex_buffer_size,
         );
         let device_address_info = vk::BufferDeviceAddressInfo::builder().buffer(vertex_buffer.buffer);
-        let buffer_device_address = unsafe { &self.device.get_buffer_device_address(&device_address_info) };
+        let buffer_device_address = unsafe { self.device.get_buffer_device_address(&device_address_info) };
         let index_buffer = AllocatedBuffer::new(
             &self.device,
             &mut self.allocator,
@@ -442,24 +450,50 @@ impl App {
             let index_buffer_ptr = vertex_buffer_ptr.add(vertices.len()) as *mut u32;
             index_buffer_ptr.copy_from_nonoverlapping(indices.as_ptr(), indices.len());
         };
-        self.immediate_submit()(vertex_buffer, buffer_device_address, index_buffer)
+        self.immediate_submit(Box::new(move |this, cmd| {
+            let vertex_copy = vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: vertex_buffer_size,
+            };
+            unsafe {
+                this.device.cmd_copy_buffer(cmd, staging.buffer, vertex_buffer.buffer, &[vertex_copy]);
+            };
+            let index_copy = vk::BufferCopy {
+                src_offset: vertex_buffer_size,
+                dst_offset: 0,
+                size: index_buffer_size,
+            };
+            unsafe {
+                this.device.cmd_copy_buffer(cmd, staging.buffer, index_buffer.buffer, &[index_copy]);
+            };
+        }));
+        staging.destroy(&self.device, &mut self.allocator);
+        let mesh = Mesh {
+            vertex_buffer,
+            vertex_address: buffer_device_address,
+            index_buffer,
+        };
+        self.meshes.push(mesh);
     }
-    fn immediate_submit(&mut self, cmd: Box<dyn FnOnce(vk::CommandBuffer)>) {
-        let cmd_pool = self.frames[(self.current_frame % FRAME_OVERLAP as u32) as usize].command_pool;
-        let cmd_buffer = self.frames[(self.current_frame % FRAME_OVERLAP as u32) as usize].command_buffer;
+    fn immediate_submit(&mut self, cmd: Box<dyn Fn(&mut Self, CommandBuffer)>) {
+        let cmd_buffer = self.immediate_command_buffer;
         unsafe {
             self.device
                 .reset_command_buffer(cmd_buffer, vk::CommandBufferResetFlags::empty())
                 .unwrap();
             let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.device.begin_command_buffer(cmd_buffer, &begin_info).unwrap();
-            cmd(cmd_buffer);
+            cmd(self, cmd_buffer);
             self.device.end_command_buffer(cmd_buffer).unwrap();
-            let submit_info = vk::SubmitInfo::builder().command_buffers(&[cmd_buffer]);
+            let cmd_buffer_submit = vk::CommandBufferSubmitInfo::builder().command_buffer(cmd_buffer);
+            let cmd_buffer_submits = [*cmd_buffer_submit];
+            let submit_info = vk::SubmitInfo2::builder().command_buffer_infos(&cmd_buffer_submits);
+            let submits = [*submit_info];
             self.device
-                .queue_submit(self.graphics_queue.0, &[submit_info], vk::Fence::null())
+                .queue_submit2(self.graphics_queue.0, &submits, self.immediate_fence)
                 .unwrap();
-            self.device.queue_wait_idle(self.graphics_queue.0).unwrap();
+            self.device.wait_for_fences(&[self.immediate_fence], true, 1000000000).unwrap();
         }
     }
     fn current_frame(&self) -> &FrameData {
@@ -635,6 +669,7 @@ impl App {
             self.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.triangle_pipeline);
         };
+
         let viewport = vk::Viewport::builder()
             .width(Self::WIDTH as f32)
             .height(Self::HEIGHT as f32)
@@ -646,7 +681,21 @@ impl App {
         unsafe {
             self.device.cmd_set_viewport(cmd, 0, &[viewport.build()]);
             self.device.cmd_set_scissor(cmd, 0, &[scissor.build()]);
-            self.device.cmd_draw(cmd, 3, 1, 0, 0);
+            for mesh in self.meshes.as_slice() {
+                let push_constants = PushConstants {
+                    world_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                    vertex_buffer: mesh.vertex_address
+                };
+                self.device.cmd_push_constants(
+                    cmd,
+                    self.triangle_pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    bytemuck::cast_slice(&[push_constants]),
+                );
+                self.device.cmd_bind_index_buffer(cmd, mesh.index_buffer.buffer, 0, vk::IndexType::UINT32);
+                self.device.cmd_draw_indexed(cmd, 6, 1, 0, 0,0);
+            }
             self.device.cmd_end_rendering(cmd);
         }
     }
@@ -684,6 +733,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new();
 
     let mut app = App::new(&event_loop)?;
+    let vertices = [
+        Vertex {
+            position: [0.5, -0.5, 0.0],
+            color: [0.0, 0.0, 0.0, 1.0],
+            normal: [0.0, 0.0, 1.0],
+            uv_x: 0.0,
+            uv_y: 0.0,
+        },
+        Vertex {
+            position: [0.5, 0.5, 0.0],
+            color: [0.5, 0.5, 0.5, 1.0],
+            normal: [0.0, 0.0, 1.0],
+            uv_x: 0.0,
+            uv_y: 0.0,
+        },
+        Vertex {
+            position: [-0.5, -0.5, 0.0],
+            color: [1.0, 0.0, 0.0, 1.0],
+            normal: [0.0, 0.0, 1.0],
+            uv_x: 0.0,
+            uv_y: 0.0,
+        },
+        Vertex {
+            position: [-0.5, 0.5, 0.0],
+            color: [0.0, 1.0, 0.0, 1.0],
+            normal: [0.0, 0.0, 1.0],
+            uv_x: 0.0,
+            uv_y: 0.0,
+        }
+    ];
+    
+    let indices = [0, 1, 2, 2, 1, 3];
+    app.upload_mesh(&indices, &vertices);
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent {
             event:

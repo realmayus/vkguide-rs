@@ -369,6 +369,7 @@ dependencies = [
  "ash-window",
  "bytemuck",
  "env_logger",
+ "glam",
  "gpu-alloc",
  "gpu-alloc-ash",
  "log",
@@ -466,6 +467,12 @@ name = "foreign-types-shared"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
+
+[[package]]
+name = "glam"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e05e7e6723e3455f4818c7b26e855439f7546cf617ef669d1adedb8669e5cb9"
 
 [[package]]
 name = "gpu-alloc"

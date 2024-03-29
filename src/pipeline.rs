@@ -4,18 +4,18 @@ use bytemuck::{Pod, Zeroable};
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Debug)]
 pub(crate) struct Vertex {
-    position: [f32; 3],
-    uv_x: f32,
-    normal: [f32; 3],
-    uv_y: f32,
-    color: [f32; 4],
+    pub(crate) position: [f32; 3],
+    pub(crate) uv_x: f32,
+    pub(crate) normal: [f32; 3],
+    pub(crate) uv_y: f32,
+    pub(crate) color: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Debug)]
 pub(crate) struct PushConstants {
-    world_matrix: [[f32; 4]; 4],
-    vertex_buffer: vk::DeviceAddress,
+    pub(crate) world_matrix: [[f32; 4]; 4],
+    pub(crate) vertex_buffer: vk::DeviceAddress,
 }
 
 pub struct PipelineBuilder {
