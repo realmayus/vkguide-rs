@@ -40,6 +40,7 @@ struct App {
     frames: [FrameData; FRAME_OVERLAP],
     current_frame: u32,
     window: winit::window::Window,
+    window_size: (u32, u32),
     allocator: Allocator,
     main_deletion_queue: DeletionQueue,
     draw_image: Option<AllocatedImage>,
@@ -64,12 +65,11 @@ struct Mesh {
 
 
 impl App {
-    const WIDTH: u32 = 800;
-    const HEIGHT: u32 = 600;
     const SWAPCHAIN_IMAGE_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
     const API_VERSION: u32 = vk::make_api_version(0, 1, 3, 0);
 
     fn new(event_loop: &EventLoop<()>) -> Result<Self, Box<dyn Error>> {
+        let window_size = (800, 600);
         let (instance, surface_khr, surface, entry, window) = unsafe {
             let entry = ash::Entry::load()?;
             let surface_extensions = ash_window::enumerate_required_extensions(event_loop.raw_display_handle())?;
@@ -81,7 +81,7 @@ impl App {
             let instance = entry.create_instance(&instance_desc, None)?;
 
             let window = WindowBuilder::new()
-                .with_inner_size(PhysicalSize::<u32>::from((Self::WIDTH, Self::HEIGHT)))
+                .with_inner_size(PhysicalSize::<u32>::from(window_size))
                 .with_title("Vulkan Engine")
                 .build(event_loop)?;
 
@@ -101,7 +101,7 @@ impl App {
 
         let capabilities = unsafe { surface.get_physical_device_surface_capabilities(physical_device, surface_khr) }?;
         let ((swapchain, swapchain_khr), swapchain_images, swapchain_views, draw_image) =
-            Self::create_swapchain(&instance, &device, surface_khr, capabilities, &mut allocator);
+            Self::create_swapchain(&instance, &device, surface_khr, capabilities, &mut allocator, window_size);
         let (immediate_command_pool, immediate_command_buffer, immediate_fence, frames) = Self::init_commands(graphics_queue.1, &device, &mut deletion_queue);
         let (descriptor_allocator, draw_image_descriptor_set_layout, draw_image_descriptor_set) =
             Self::init_descriptors(&device, draw_image.view, &mut deletion_queue);
@@ -123,6 +123,7 @@ impl App {
             frames,
             current_frame: 0,
             window,
+            window_size,
             allocator,
             main_deletion_queue: deletion_queue,
             draw_image: Some(draw_image),
@@ -213,14 +214,15 @@ impl App {
         surface_khr: vk::SurfaceKHR,
         capabilities: vk::SurfaceCapabilitiesKHR,
         allocator: &mut Allocator,
+        window_size: (u32, u32),
     ) -> ((Swapchain, vk::SwapchainKHR), Vec<vk::Image>, Vec<vk::ImageView>, AllocatedImage) {
         let create_info = vk::SwapchainCreateInfoKHR {
             surface: surface_khr,
             image_format: Self::SWAPCHAIN_IMAGE_FORMAT,
             present_mode: vk::PresentModeKHR::FIFO, // hard vsync
             image_extent: vk::Extent2D {
-                width: Self::WIDTH,
-                height: Self::HEIGHT,
+                width: window_size.0,
+                height: window_size.1,
             },
             image_usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT,
             pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
@@ -263,8 +265,8 @@ impl App {
             device.clone(),
             allocator,
             vk::Extent3D {
-                width: Self::WIDTH,
-                height: Self::HEIGHT,
+                width: window_size.0,
+                height: window_size.1,
                 depth: 1,
             },
             Self::SWAPCHAIN_IMAGE_FORMAT,
@@ -435,10 +437,31 @@ impl App {
         
         (layout, pipeline, vertex_shader, fragment_shader)
     }
-
+    unsafe fn destroy_swapchain(&mut self) {
+        self.swapchain.0.destroy_swapchain(self.swapchain.1, None);
+        for view in self.swapchain_views.drain(..) {
+            self.device.destroy_image_view(view, None);
+        }
+    }
+    fn resize_swapchain(&mut self, size: (u32, u32)) {
+        unsafe { 
+            self.device.device_wait_idle().unwrap();
+            self.destroy_swapchain();
+            self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator);
+        }
+        self.window_size = size;
+        let capabilities = unsafe { self.surface_fn.get_physical_device_surface_capabilities(self.physical_device, self.surface).unwrap() };
+        let (swapchain, swapchain_images, swapchain_views, draw_image) = 
+            Self::create_swapchain(&self.instance, &self.device, self.surface, capabilities, &mut self.allocator, self.window_size);
+        self.swapchain = swapchain;
+        self.swapchain_images = swapchain_images;
+        self.swapchain_views = swapchain_views;
+        self.draw_image = Some(draw_image);
+    }
+    
     fn upload_mesh(&mut self, indices: &[u32], vertices: &[Vertex]) {
-        let vertex_buffer_size = (vertices.len() * std::mem::size_of::<Vertex>()) as vk::DeviceSize;
-        let index_buffer_size = (indices.len() * std::mem::size_of::<u32>()) as vk::DeviceSize;
+        let vertex_buffer_size = std::mem::size_of_val(vertices) as vk::DeviceSize;
+        let index_buffer_size = std::mem::size_of_val(indices) as vk::DeviceSize;
         let vertex_buffer = AllocatedBuffer::new(
             &self.device,
             &mut self.allocator,
@@ -610,8 +633,8 @@ impl App {
                     height: self.draw_image.as_ref().unwrap().extent.height,
                 },
                 vk::Extent2D {
-                    width: Self::WIDTH,
-                    height: Self::HEIGHT,
+                    width: self.window_size.0,
+                    height: self.window_size.1,
                 },
             );
             // transition the swapchain image to present mode
@@ -654,7 +677,7 @@ impl App {
                 .wait_semaphores(&semaphores);
             self.swapchain.0.queue_present(self.present_queue.0, &present_info).unwrap();
         }
-        self.current_frame += 1;
+        self.current_frame = self.current_frame.wrapping_add(1);
     }
 
     fn draw_background(&self, cmd: vk::CommandBuffer) {
@@ -686,8 +709,8 @@ impl App {
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: vk::Extent2D {
-                    width: Self::WIDTH,
-                    height: Self::HEIGHT,
+                    width: self.window_size.0,
+                    height: self.window_size.1,
                 },
             })
             .layer_count(1)
@@ -699,12 +722,12 @@ impl App {
         };
 
         let viewport = vk::Viewport::builder()
-            .width(Self::WIDTH as f32)
-            .height(Self::HEIGHT as f32)
+            .width(self.window_size.0 as f32)
+            .height(self.window_size.1 as f32)
             .max_depth(1.0);
         let scissor = vk::Rect2D::builder().extent(vk::Extent2D {
-            width: Self::WIDTH,
-            height: Self::HEIGHT,
+            width: self.window_size.0,
+            height: self.window_size.1,
         });
         unsafe {
             self.device.cmd_set_viewport(cmd, 0, &[viewport.build()]);
@@ -747,10 +770,7 @@ impl Drop for App {
                 self.device.destroy_semaphore(frame.swapchain_semaphore, None);
                 self.device.destroy_semaphore(frame.render_semaphore, None);
             }
-            self.swapchain.0.destroy_swapchain(self.swapchain.1, None);
-            for view in self.swapchain_views.drain(..) {
-                self.device.destroy_image_view(view, None);
-            }
+            self.destroy_swapchain();
             self.device.destroy_device(None);
             self.surface_fn.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
@@ -811,6 +831,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             window_id: _,
         } => {
             *control_flow = ControlFlow::Exit;
+        }
+        Event::WindowEvent {
+            event: WindowEvent::Resized(size), ..
+        } => {
+            app.resize_swapchain((size.width, size.height));
         }
         Event::MainEventsCleared => {
             app.window.request_redraw();
