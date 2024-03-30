@@ -1,3 +1,5 @@
+extern crate core;
+
 mod pipeline;
 mod resources;
 mod util;
@@ -7,7 +9,6 @@ use ash::extensions::khr::{Surface, Swapchain};
 use crate::pipeline::{PipelineBuilder, PushConstants, Vertex};
 use crate::resources::{AllocUsage, AllocatedBuffer, AllocatedImage, Allocator, DescriptorAllocator, PoolSizeRatio};
 use crate::util::{device_discovery, load_shader_module, DeletionQueue, DescriptorLayoutBuilder};
-use ash::vk::{CommandBuffer, CommandPool};
 use ash::{vk, Device, Instance};
 use gpu_alloc::GpuAllocator;
 use gpu_alloc_ash::{device_properties, AshMemoryDevice};
@@ -22,6 +23,7 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
+use crate::pipeline::mesh::MeshPipeline;
 
 const FRAME_OVERLAP: usize = 2;
 
@@ -47,15 +49,12 @@ struct App {
     descriptor_allocator: DescriptorAllocator,
     draw_image_descriptor_set: vk::DescriptorSet,
     draw_image_descriptor_set_layout: vk::DescriptorSetLayout,
-    triangle_pipeline_layout: vk::PipelineLayout,
-    triangle_pipeline: vk::Pipeline,
-    vertex_shader: vk::ShaderModule,
-    frag_shader: vk::ShaderModule,
+    mesh_pipeline: MeshPipeline,
     immediate_fence: vk::Fence,
-    immediate_command_pool: CommandPool,
-    immediate_command_buffer: CommandBuffer,
-    meshes: Vec<Mesh>,
+    immediate_command_pool: vk::CommandPool,
+    immediate_command_buffer: vk::CommandBuffer,
     depth_image: Option<AllocatedImage>,
+    meshes: Vec<Mesh>,
 }
 
 struct Mesh {
@@ -64,18 +63,18 @@ struct Mesh {
     vertex_address: vk::DeviceAddress,
 }
 
+pub const SWAPCHAIN_IMAGE_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
+pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+pub const API_VERSION: u32 = vk::make_api_version(0, 1, 3, 0);
 
 impl App {
-    const SWAPCHAIN_IMAGE_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
-    const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
-    const API_VERSION: u32 = vk::make_api_version(0, 1, 3, 0);
 
     fn new(event_loop: &EventLoop<()>) -> Result<Self, Box<dyn Error>> {
         let window_size = (800, 600);
         let (instance, surface_khr, surface, entry, window) = unsafe {
             let entry = ash::Entry::load()?;
             let surface_extensions = ash_window::enumerate_required_extensions(event_loop.raw_display_handle())?;
-            let app_desc = vk::ApplicationInfo::builder().api_version(Self::API_VERSION);
+            let app_desc = vk::ApplicationInfo::builder().api_version(API_VERSION);
             let instance_desc = vk::InstanceCreateInfo::builder()
                 .application_info(&app_desc)
                 .enabled_extension_names(surface_extensions);
@@ -98,7 +97,7 @@ impl App {
             Self::create_logical_device_and_queue(&instance, &surface, surface_khr, physical_device);
 
         let config = gpu_alloc::Config::i_am_prototyping();
-        let device_properties = unsafe { device_properties(&instance, Self::API_VERSION, physical_device)? };
+        let device_properties = unsafe { device_properties(&instance, API_VERSION, physical_device)? };
         let mut allocator = GpuAllocator::new(config, device_properties);
 
         let capabilities = unsafe { surface.get_physical_device_surface_capabilities(physical_device, surface_khr) }?;
@@ -107,8 +106,7 @@ impl App {
         let (immediate_command_pool, immediate_command_buffer, immediate_fence, frames) = Self::init_commands(graphics_queue.1, &device, &mut deletion_queue);
         let (descriptor_allocator, draw_image_descriptor_set_layout, draw_image_descriptor_set) =
             Self::init_descriptors(&device, draw_image.view, &mut deletion_queue);
-        let (triangle_pipeline_layout, triangle_pipeline, vertex_shader, frag_shader) =
-            Self::init_pipelines(&device, &mut deletion_queue);
+        let mesh_pipeline = MeshPipeline::new(&device, window_size, &mut deletion_queue);
 
         Ok(App {
             entry,
@@ -128,19 +126,16 @@ impl App {
             window_size,
             allocator,
             main_deletion_queue: deletion_queue,
-            draw_image: Some(draw_image),
+            draw_image: Some(draw_image),  // must be present at all times, Option<_> because we need ownership when destroying
             depth_image: Some(depth_image),
             descriptor_allocator,
             draw_image_descriptor_set,
             draw_image_descriptor_set_layout,
-            vertex_shader,
-            frag_shader,
-            triangle_pipeline_layout,
-            triangle_pipeline,
+            mesh_pipeline,
             immediate_command_pool,
             immediate_command_buffer, 
             immediate_fence,
-            meshes: Vec::new(),
+            meshes: vec![],
         })
     }
 
@@ -221,7 +216,7 @@ impl App {
     ) -> ((Swapchain, vk::SwapchainKHR), Vec<vk::Image>, Vec<vk::ImageView>, AllocatedImage, AllocatedImage) {
         let create_info = vk::SwapchainCreateInfoKHR {
             surface: surface_khr,
-            image_format: Self::SWAPCHAIN_IMAGE_FORMAT,
+            image_format: SWAPCHAIN_IMAGE_FORMAT,
             present_mode: vk::PresentModeKHR::FIFO, // hard vsync
             image_extent: vk::Extent2D {
                 width: window_size.0,
@@ -246,7 +241,7 @@ impl App {
                 let create_info = vk::ImageViewCreateInfo::builder()
                     .image(*image)
                     .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(Self::SWAPCHAIN_IMAGE_FORMAT)
+                    .format(SWAPCHAIN_IMAGE_FORMAT)
                     .components(vk::ComponentMapping {
                         r: vk::ComponentSwizzle::IDENTITY,
                         g: vk::ComponentSwizzle::IDENTITY,
@@ -272,13 +267,14 @@ impl App {
                 height: window_size.1,
                 depth: 1,
             },
-            Self::SWAPCHAIN_IMAGE_FORMAT,
+            SWAPCHAIN_IMAGE_FORMAT,
             vk::ImageUsageFlags::TRANSFER_DST
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::STORAGE
                 | vk::ImageUsageFlags::COLOR_ATTACHMENT,
             AllocUsage::GpuOnly,
             vk::ImageAspectFlags::COLOR,
+            Some("Draw Image".into())
         );
         
         let depth_image = AllocatedImage::new(
@@ -289,16 +285,17 @@ impl App {
                 height: window_size.1,
                 depth: 1,
             },
-            Self::DEPTH_FORMAT,
+            DEPTH_FORMAT,
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             AllocUsage::GpuOnly,
             vk::ImageAspectFlags::DEPTH,
+            Some("Depth Image".into())
         );
 
         ((swapchain, swapchain_khr), images, image_views, draw_image, depth_image)
     }
 
-    fn init_commands(queue_family_index: u32, device: &Device, deletion_queue: &mut DeletionQueue) -> (CommandPool, CommandBuffer, vk::Fence, [FrameData; FRAME_OVERLAP]) {
+    fn init_commands(queue_family_index: u32, device: &Device, deletion_queue: &mut DeletionQueue) -> (vk::CommandPool, vk::CommandBuffer, vk::Fence, [FrameData; FRAME_OVERLAP]) {
         let command_pool_create_info = vk::CommandPoolCreateInfo::builder()
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER) // we want to be able to reset individual command buffers, not the entire pool at once
             .queue_family_index(queue_family_index);
@@ -378,88 +375,17 @@ impl App {
         });
         (descriptor_pool, layout, descriptor_set)
     }
-
-    fn init_pipelines(
-        device: &Device,
-        deletion_queue: &mut DeletionQueue,
-    ) -> (vk::PipelineLayout, vk::Pipeline, vk::ShaderModule, vk::ShaderModule) {
-        Self::init_mesh_pipeline(device, deletion_queue)
-    }
-
-    fn init_mesh_pipeline(device: &Device, deletion_queue: &mut DeletionQueue) -> (vk::PipelineLayout, vk::Pipeline, vk::ShaderModule, vk::ShaderModule) {
-        let vertex_shader =
-            load_shader_module(device, include_bytes!("shaders/spirv/mesh.vert.spv")).expect("Failed to load vertex shader module");
-        let fragment_shader =
-            load_shader_module(device, include_bytes!("shaders/spirv/mesh.frag.spv")).expect("Failed to load fragment shader module");
-        let push_constant_range = [*vk::PushConstantRange::builder().offset(0).size(std::mem::size_of::<PushConstants>() as u32).stage_flags(vk::ShaderStageFlags::VERTEX)];
-        let layout_create_info = vk::PipelineLayoutCreateInfo::builder().set_layouts(&[]).push_constant_ranges(&push_constant_range);
-        let layout = unsafe { device.create_pipeline_layout(&layout_create_info, None).unwrap() };
-        let pipeline_builder = PipelineBuilder {
-            layout,
-            depth_stencil: *vk::PipelineDepthStencilStateCreateInfo::builder()
-                .depth_test_enable(true)
-                .depth_write_enable(true)
-                .depth_compare_op(vk::CompareOp::GREATER_OR_EQUAL)
-                .depth_bounds_test_enable(false)
-                .stencil_test_enable(false)
-                .front(Default::default())
-                .back(Default::default())
-                .min_depth_bounds(0.0)
-                .max_depth_bounds(1.0),
-            render_info: *vk::PipelineRenderingCreateInfo::builder()
-                .color_attachment_formats(&[Self::SWAPCHAIN_IMAGE_FORMAT])
-                .depth_attachment_format(Self::DEPTH_FORMAT),
-            shader_stages: vec![
-                vk::PipelineShaderStageCreateInfo::builder()
-                    .stage(vk::ShaderStageFlags::VERTEX)
-                    .module(vertex_shader)
-                    .name(CStr::from_bytes_with_nul(b"main\0").unwrap())
-                    .build(),
-                vk::PipelineShaderStageCreateInfo::builder()
-                    .stage(vk::ShaderStageFlags::FRAGMENT)
-                    .module(fragment_shader)
-                    .name(CStr::from_bytes_with_nul(b"main\0").unwrap())
-                    .build(),
-            ],
-            input_assembly: *vk::PipelineInputAssemblyStateCreateInfo::builder().topology(vk::PrimitiveTopology::TRIANGLE_LIST),
-            rasterization: *vk::PipelineRasterizationStateCreateInfo::builder()
-                .polygon_mode(vk::PolygonMode::FILL)
-                .cull_mode(vk::CullModeFlags::NONE)
-                .front_face(vk::FrontFace::CLOCKWISE)
-                .line_width(1.0),
-            color_blend_attachment: *vk::PipelineColorBlendAttachmentState::builder()
-                .blend_enable(false)
-                .color_write_mask(vk::ColorComponentFlags::RGBA),
-            multisample: *vk::PipelineMultisampleStateCreateInfo::builder()
-                .sample_shading_enable(false)
-                .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-                .min_sample_shading(1.0)
-                .alpha_to_coverage_enable(false)
-                .alpha_to_one_enable(false),
-            color_attachment_format: Self::SWAPCHAIN_IMAGE_FORMAT,
-        };
-
-        let pipeline = pipeline_builder.build(device);
-        
-        unsafe {
-            device.destroy_shader_module(vertex_shader, None);
-            device.destroy_shader_module(fragment_shader, None);
-        }
-
-        deletion_queue.push(move |device| {
-            unsafe {
-                device.destroy_pipeline_layout(layout, None);
-                device.destroy_pipeline(pipeline, None);
-            }
-        });
-        
-        (layout, pipeline, vertex_shader, fragment_shader)
-    }
     unsafe fn destroy_swapchain(&mut self) {
         self.swapchain.0.destroy_swapchain(self.swapchain.1, None);
         for view in self.swapchain_views.drain(..) {
             self.device.destroy_image_view(view, None);
         }
+    }
+    
+    fn resize(&mut self, size: (u32, u32)) {
+        debug!("Resizing to {:?}", size);
+        self.resize_swapchain(size);
+        self.mesh_pipeline.resize(size);
     }
     fn resize_swapchain(&mut self, size: (u32, u32)) {
         unsafe { 
@@ -479,7 +405,7 @@ impl App {
         self.depth_image = Some(depth_image);
     }
     
-    fn upload_mesh(&mut self, indices: &[u32], vertices: &[Vertex]) {
+    fn upload_mesh(&mut self, indices: &[u32], vertices: &[Vertex]) -> Mesh {
         let vertex_buffer_size = std::mem::size_of_val(vertices) as vk::DeviceSize;
         let index_buffer_size = std::mem::size_of_val(indices) as vk::DeviceSize;
         let vertex_buffer = AllocatedBuffer::new(
@@ -488,6 +414,7 @@ impl App {
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             AllocUsage::GpuOnly,
             vertex_buffer_size,
+            Some("Vertex Buffer".into()),
         );
         let device_address_info = vk::BufferDeviceAddressInfo::builder().buffer(vertex_buffer.buffer);
         let buffer_device_address = unsafe { self.device.get_buffer_device_address(&device_address_info) };
@@ -497,6 +424,7 @@ impl App {
             vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             AllocUsage::GpuOnly,
             index_buffer_size,
+            Some("Index Buffer".into()),
         );
 
 
@@ -506,6 +434,7 @@ impl App {
             vk::BufferUsageFlags::TRANSFER_SRC,
             AllocUsage::Shared,
             vertex_buffer_size + index_buffer_size,
+            Some("Staging Buffer".into()),
         );
 
         let map = unsafe {
@@ -540,14 +469,13 @@ impl App {
             };
         }));
         staging.destroy(&self.device, &mut self.allocator);
-        let mesh = Mesh {
+        Mesh {
             vertex_buffer,
             vertex_address: buffer_device_address,
             index_buffer,
-        };
-        self.meshes.push(mesh);
+        }
     }
-    fn immediate_submit(&mut self, cmd: Box<dyn Fn(&mut Self, CommandBuffer)>) {
+    fn immediate_submit(&mut self, cmd: Box<dyn Fn(&mut Self, vk::CommandBuffer)>) {
         let cmd_buffer = self.immediate_command_buffer;
         unsafe {
             self.device.reset_fences(&[self.immediate_fence]).unwrap();
@@ -632,7 +560,7 @@ impl App {
                 vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
             );
             
-            self.draw_geometry(cmd_buffer);
+            self.mesh_pipeline.draw(&self.device, cmd_buffer, &self.meshes, self.draw_image.as_ref().unwrap().view, self.depth_image.as_ref().unwrap().view);
 
             // prepare copying of the draw image to the swapchain image
             util::transition_image(
@@ -725,68 +653,6 @@ impl App {
             );
         }
     }
-
-    fn draw_geometry(&self, cmd: vk::CommandBuffer) {
-        let color_attachment = vk::RenderingAttachmentInfo::builder()
-            .image_view(self.draw_image.as_ref().unwrap().view)
-            .image_layout(vk::ImageLayout::GENERAL);
-        let color_attachments = [color_attachment.build()];
-        let depth_attachment = *vk::RenderingAttachmentInfo::builder()
-            .image_view(self.depth_image.as_ref().unwrap().view)
-            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(vk::ClearValue {
-                depth_stencil: vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 },
-            });
-        
-        let render_info = vk::RenderingInfo::builder()
-            .color_attachments(&color_attachments)
-            .depth_attachment(&depth_attachment)
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D {
-                    width: self.window_size.0,
-                    height: self.window_size.1,
-                },
-            })
-            .layer_count(1)
-            .view_mask(0);
-        unsafe {
-            self.device.cmd_begin_rendering(cmd, &render_info);
-            self.device
-                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.triangle_pipeline);
-        };
-
-        let viewport = vk::Viewport::builder()
-            .width(self.window_size.0 as f32)
-            .height(self.window_size.1 as f32)
-            .max_depth(1.0);
-        let scissor = vk::Rect2D::builder().extent(vk::Extent2D {
-            width: self.window_size.0,
-            height: self.window_size.1,
-        });
-        unsafe {
-            self.device.cmd_set_viewport(cmd, 0, &[viewport.build()]);
-            self.device.cmd_set_scissor(cmd, 0, &[scissor.build()]);
-            for mesh in self.meshes.as_slice() {
-                let push_constants = PushConstants {
-                    world_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
-                    vertex_buffer: mesh.vertex_address
-                };
-                self.device.cmd_push_constants(
-                    cmd,
-                    self.triangle_pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    bytemuck::cast_slice(&[push_constants]),
-                );
-                self.device.cmd_bind_index_buffer(cmd, mesh.index_buffer.buffer, 0, vk::IndexType::UINT32);
-                self.device.cmd_draw_indexed(cmd, 6, 1, 0, 0,0);
-            }
-            self.device.cmd_end_rendering(cmd);
-        }
-    }
 }
 
 impl Drop for App {
@@ -853,7 +719,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     ];
 
     let indices = [0, 1, 2, 2, 1, 3];
-    app.upload_mesh(&indices, &vertices);
+    let mesh = app.upload_mesh(&indices, &vertices);
+    app.meshes.push(mesh);
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent {
             event:
@@ -873,7 +740,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Event::WindowEvent {
             event: WindowEvent::Resized(size), ..
         } => {
-            app.resize_swapchain((size.width, size.height));
+            app.resize((size.width, size.height));
         }
         Event::MainEventsCleared => {
             app.window.request_redraw();

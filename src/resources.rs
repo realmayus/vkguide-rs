@@ -1,6 +1,7 @@
 use ash::{Device, vk};
 use ash::vk::{DeviceMemory, DeviceSize};
 use gpu_alloc_ash::AshMemoryDevice;
+use log::debug;
 
 pub type Allocation = gpu_alloc::MemoryBlock<DeviceMemory>;
 pub type Allocator = gpu_alloc::GpuAllocator<DeviceMemory>;
@@ -47,6 +48,7 @@ pub struct AllocatedBuffer {
     pub buffer: vk::Buffer,
     pub(crate) allocation: Allocation,
     pub(crate) size: DeviceSize,
+    pub label: Option<String>,
 }
 
 impl AllocatedBuffer {
@@ -56,6 +58,7 @@ impl AllocatedBuffer {
         buffer_usages: vk::BufferUsageFlags,
         alloc_usages: AllocUsage,
         size: DeviceSize,
+        label: Option<String>,
     ) -> Self {
         let info = vk::BufferCreateInfo::builder()
             .size(size)
@@ -74,7 +77,7 @@ impl AllocatedBuffer {
             ).unwrap()
         };
 
-        log::info!("Creating buffer {:?} of size {} B", buffer, size);
+        debug!("Creating buffer '{}' ({:?}) of size {} B", label.clone().unwrap_or_default(), buffer, size);
 
         unsafe { device.bind_buffer_memory(buffer, *allocation.memory(), allocation.offset()).unwrap() };
 
@@ -82,22 +85,15 @@ impl AllocatedBuffer {
             buffer,
             allocation,
             size,
+            label,
         }
     }
 
     pub fn destroy(self, device: &Device, allocator: &mut Allocator) {
-        log::info!("Destroying buffer {:?} of size {}", self.buffer, self.size);
+        debug!("Destroying buffer '{}' ({:?}) of size {}", self.label.unwrap_or_default(), self.buffer, self.size);
         unsafe { device.destroy_buffer(self.buffer, None) };
         unsafe { allocator.dealloc(AshMemoryDevice::wrap(device), self.allocation) };
     }
-}
-
-pub struct AllocatedImage {
-    pub image: vk::Image,
-    pub view: vk::ImageView,
-    allocation: Allocation,
-    pub extent: vk::Extent3D,
-    format: vk::Format,
 }
 
 pub enum AllocUsage {
@@ -116,6 +112,15 @@ impl AllocUsage {
     }
 }
 
+pub struct AllocatedImage {
+    pub image: vk::Image,
+    pub view: vk::ImageView,
+    allocation: Allocation,
+    pub extent: vk::Extent3D,
+    format: vk::Format,
+    label: Option<String>,
+}
+
 impl AllocatedImage {
     pub fn new(
         device: Device,
@@ -125,6 +130,7 @@ impl AllocatedImage {
         image_usages: vk::ImageUsageFlags,
         alloc_usages: AllocUsage,
         image_aspect: vk::ImageAspectFlags,
+        label: Option<String>,
     ) -> Self {
         let info = vk::ImageCreateInfo::builder()
             .image_type(vk::ImageType::TYPE_2D)
@@ -149,7 +155,7 @@ impl AllocatedImage {
                 },
             ).unwrap()
         };
-        log::info!("Creating image {:?} of size {:?} and format {:?}", image, extent, format);
+        debug!("Creating image '{}' ({:?}) of size {:?} and format {:?}", label.clone().unwrap_or_default(), image, extent, format);
         unsafe { device.bind_image_memory(image, *allocation.memory(), allocation.offset()).unwrap() };
 
         let view_create_info = vk::ImageViewCreateInfo::builder()
@@ -176,11 +182,12 @@ impl AllocatedImage {
             allocation,
             extent,
             format,
+            label,
         }
     }
 
     pub fn destroy(self, device: &Device, allocator: &mut Allocator) {
-        log::info!("Destroying image {:?} of size {:?} and format {:?}", self.image, self.extent, self.format);
+        debug!("Destroying image '{}' ({:?}) of size {:?} and format {:?}", self.label.unwrap_or_default(), self.image, self.extent, self.format);
         unsafe { device.destroy_image_view(self.view, None) };
         unsafe { device.destroy_image(self.image, None) };
         unsafe { allocator.dealloc(AshMemoryDevice::wrap(device), self.allocation) };
