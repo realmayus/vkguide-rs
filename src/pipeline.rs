@@ -13,14 +13,6 @@ pub(crate) struct Vertex {
     pub(crate) uv_y: f32,
     pub(crate) color: [f32; 4],
 }
-
-#[repr(C)]
-#[derive(Pod, Zeroable, Copy, Clone, Debug)]
-pub(crate) struct PushConstants {
-    pub(crate) world_matrix: [[f32; 4]; 4],
-    pub(crate) vertex_buffer: vk::DeviceAddress,
-}
-
 pub struct PipelineBuilder {
     pub shader_stages: Vec<vk::PipelineShaderStageCreateInfo>,
     pub input_assembly: vk::PipelineInputAssemblyStateCreateInfo,

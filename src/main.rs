@@ -3,19 +3,22 @@ extern crate core;
 mod pipeline;
 mod resources;
 mod util;
+mod gltf;
 
 use ash::extensions::khr::{Surface, Swapchain};
 
-use crate::pipeline::{PipelineBuilder, PushConstants, Vertex};
+use crate::pipeline::{PipelineBuilder, Vertex};
 use crate::resources::{AllocUsage, AllocatedBuffer, AllocatedImage, Allocator, DescriptorAllocator, PoolSizeRatio};
 use crate::util::{device_discovery, load_shader_module, DeletionQueue, DescriptorLayoutBuilder};
 use ash::{vk, Device, Instance};
 use gpu_alloc::GpuAllocator;
 use gpu_alloc_ash::{device_properties, AshMemoryDevice};
-use log::debug;
+use log::{debug, info};
 use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 use std::error::Error;
 use std::ffi::CStr;
+use std::path::Path;
+use glam::{Vec2, Vec3};
 use util::FrameData;
 use winit::{
     dpi::PhysicalSize,
@@ -57,11 +60,25 @@ struct App {
     meshes: Vec<Mesh>,
 }
 
-struct Mesh {
+#[derive(Default)]
+pub struct Model {
+    pub meshes: Vec<Mesh>,
+    pub children: Vec<Model>,
+}
+pub struct GpuMesh {
     index_buffer: AllocatedBuffer,
     vertex_buffer: AllocatedBuffer,
     vertex_address: vk::DeviceAddress,
 }
+
+pub struct Mesh {
+    pub(crate) mem: Option<GpuMesh>,
+    pub(crate) vertices: Vec<Vec3>,
+    pub(crate) indices: Vec<u32>,
+    pub(crate) normals: Vec<Vec3>,
+    pub(crate) uvs: Vec<Vec2>,
+}
+
 
 pub const SWAPCHAIN_IMAGE_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
@@ -381,7 +398,7 @@ impl App {
             self.device.destroy_image_view(view, None);
         }
     }
-    
+
     fn resize(&mut self, size: (u32, u32)) {
         debug!("Resizing to {:?}", size);
         self.resize_swapchain(size);
@@ -405,9 +422,19 @@ impl App {
         self.depth_image = Some(depth_image);
     }
     
-    fn upload_mesh(&mut self, indices: &[u32], vertices: &[Vertex]) -> Mesh {
-        let vertex_buffer_size = std::mem::size_of_val(vertices) as vk::DeviceSize;
-        let index_buffer_size = std::mem::size_of_val(indices) as vk::DeviceSize;
+    fn upload_mesh(&mut self, mesh: &Mesh) -> GpuMesh {
+        info!("Uploading mesh to GPU");
+        debug!("Mesh vertices: {:?}", mesh.vertices);
+        let vertices = mesh.vertices.iter().zip(mesh.normals.iter()).zip(mesh.uvs.iter()).map(|((vertex, normal), uv)| Vertex {
+            position: vertex.to_array(),
+            normal: normal.to_array(),
+            uv_x: uv.x,
+            uv_y: uv.y,
+            color: [0.4, 0.6, 0.3, 1.0],
+        }).collect::<Vec<_>>();
+        
+        let vertex_buffer_size = (vertices.len() * std::mem::size_of::<Vertex>()) as vk::DeviceSize;
+        let index_buffer_size = (mesh.indices.len() * std::mem::size_of::<u32>()) as vk::DeviceSize;
         let vertex_buffer = AllocatedBuffer::new(
             &self.device,
             &mut self.allocator,
@@ -448,7 +475,7 @@ impl App {
         unsafe {
             vertex_buffer_ptr.copy_from_nonoverlapping(vertices.as_ptr(), vertices.len());
             let index_buffer_ptr = vertex_buffer_ptr.add(vertices.len()) as *mut u32;
-            index_buffer_ptr.copy_from_nonoverlapping(indices.as_ptr(), indices.len());
+            index_buffer_ptr.copy_from_nonoverlapping(mesh.indices.as_ptr(), mesh.indices.len());
         };
         self.immediate_submit(Box::new(move |this, cmd| {
             let vertex_copy = vk::BufferCopy {
@@ -469,7 +496,7 @@ impl App {
             };
         }));
         staging.destroy(&self.device, &mut self.allocator);
-        Mesh {
+        GpuMesh {
             vertex_buffer,
             vertex_address: buffer_device_address,
             index_buffer,
@@ -661,8 +688,9 @@ impl Drop for App {
             self.device.device_wait_idle().unwrap();
             self.main_deletion_queue.flush(&self.device);
             for mesh in self.meshes.drain(..) {
-                mesh.index_buffer.destroy(&self.device, &mut self.allocator);
-                mesh.vertex_buffer.destroy(&self.device, &mut self.allocator);
+                let mem = mesh.mem.unwrap();
+                mem.index_buffer.destroy(&self.device, &mut self.allocator);
+                mem.vertex_buffer.destroy(&self.device, &mut self.allocator);
             }
             
             self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator);
@@ -687,40 +715,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new();
 
     let mut app = App::new(&event_loop)?;
-    let vertices = [
-        Vertex {
-            position: [0.5, -0.5, 0.0],
-            color: [0.0, 0.0, 0.0, 1.0],
-            normal: [0.0, 0.0, 1.0],
-            uv_x: 0.0,
-            uv_y: 0.0,
-        },
-        Vertex {
-            position: [0.5, 0.5, 0.0],
-            color: [0.5, 0.5, 0.5, 1.0],
-            normal: [0.0, 0.0, 1.0],
-            uv_x: 0.0,
-            uv_y: 0.0,
-        },
-        Vertex {
-            position: [-0.5, -0.5, 0.0],
-            color: [1.0, 0.0, 0.0, 1.0],
-            normal: [0.0, 0.0, 1.0],
-            uv_x: 0.0,
-            uv_y: 0.0,
-        },
-        Vertex {
-            position: [-0.5, 0.5, 0.0],
-            color: [0.0, 1.0, 0.0, 1.0],
-            normal: [0.0, 0.0, 1.0],
-            uv_x: 0.0,
-            uv_y: 0.0,
-        }
-    ];
+    let models = gltf::load_gltf(Path::new("src/assets/cube_light_tan.glb"));
+    let meshes = models.into_iter().flat_map(|mo| mo.meshes).collect::<Vec<_>>();
+    info!("Loaded gltf with {} meshes", meshes.len());
+    for mut mesh in meshes {
+        let gpu = app.upload_mesh(&mesh);
+        mesh.mem = Some(gpu);
+        app.meshes.push(mesh);
+    }
 
-    let indices = [0, 1, 2, 2, 1, 3];
-    let mesh = app.upload_mesh(&indices, &vertices);
-    app.meshes.push(mesh);
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent {
             event:

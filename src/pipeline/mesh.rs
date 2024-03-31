@@ -1,15 +1,23 @@
-use std::ffi::CStr;
-use ash::{Device, vk};
+use crate::pipeline::PipelineBuilder;
+use crate::util::{load_shader_module, DeletionQueue};
 use crate::Mesh;
-use crate::pipeline::{PipelineBuilder, PushConstants};
-use crate::util::{DeletionQueue, load_shader_module};
+use ash::{vk, Device};
+use bytemuck::{Pod, Zeroable};
+use glam::{Mat4, Vec3};
+use std::ffi::CStr;
 
 pub struct MeshPipeline {
     viewport: vk::Viewport,
     scissor: vk::Rect2D,
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
-    window_size: (u32, u32)
+    window_size: (u32, u32),
+}
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone, Debug)]
+pub(crate) struct PushConstants {
+    pub(crate) world_matrix: [[f32; 4]; 4],
+    pub(crate) vertex_buffer: vk::DeviceAddress,
 }
 
 impl MeshPipeline {
@@ -18,9 +26,14 @@ impl MeshPipeline {
             load_shader_module(device, include_bytes!("../shaders/spirv/mesh.vert.spv")).expect("Failed to load vertex shader module");
         let fragment_shader =
             load_shader_module(device, include_bytes!("../shaders/spirv/mesh.frag.spv")).expect("Failed to load fragment shader module");
-        
-        let push_constant_range = [*vk::PushConstantRange::builder().offset(0).size(std::mem::size_of::<PushConstants>() as u32).stage_flags(vk::ShaderStageFlags::VERTEX)];
-        let layout_create_info = vk::PipelineLayoutCreateInfo::builder().set_layouts(&[]).push_constant_ranges(&push_constant_range);
+
+        let push_constant_range = [*vk::PushConstantRange::builder()
+            .offset(0)
+            .size(std::mem::size_of::<PushConstants>() as u32)
+            .stage_flags(vk::ShaderStageFlags::VERTEX)];
+        let layout_create_info = vk::PipelineLayoutCreateInfo::builder()
+            .set_layouts(&[])
+            .push_constant_ranges(&push_constant_range);
         let layout = unsafe { device.create_pipeline_layout(&layout_create_info, None).unwrap() };
         let pipeline_builder = PipelineBuilder {
             layout: Some(layout),
@@ -46,14 +59,11 @@ impl MeshPipeline {
             device.destroy_shader_module(fragment_shader, None);
         }
 
-        deletion_queue.push(move |device| {
-            unsafe {
-                device.destroy_pipeline_layout(layout, None);
-                device.destroy_pipeline(pipeline, None);
-            }
+        deletion_queue.push(move |device| unsafe {
+            device.destroy_pipeline_layout(layout, None);
+            device.destroy_pipeline(pipeline, None);
         });
 
-        
         let viewport = *vk::Viewport::builder()
             .width(window_size.0 as f32)
             .height(window_size.1 as f32)
@@ -62,7 +72,7 @@ impl MeshPipeline {
             width: window_size.0,
             height: window_size.1,
         });
-        
+
         Self {
             viewport,
             scissor,
@@ -71,7 +81,7 @@ impl MeshPipeline {
             window_size,
         }
     }
-    
+
     pub fn resize(&mut self, window_size: (u32, u32)) {
         self.window_size = window_size;
         self.viewport = *vk::Viewport::builder()
@@ -111,17 +121,29 @@ impl MeshPipeline {
                 .layer_count(1)
                 .view_mask(0)
         };
+        let world = {
+            let view = Mat4::look_at_rh(Vec3::new(2.0, 3.0, 5.0), Vec3::ZERO, Vec3::new(0.0, 1.0, 0.0));
+            let mut proj = Mat4::perspective_rh(
+                60.0f32.to_radians(),
+                self.window_size.0 as f32 / self.window_size.1 as f32,
+                10000.0,
+                0.1,
+            );
+            proj.y_axis.y *= -1.0;
+
+            proj * view
+        };
 
         unsafe {
             device.cmd_begin_rendering(cmd, &render_info);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
-            
+
             device.cmd_set_viewport(cmd, 0, &[self.viewport]);
             device.cmd_set_scissor(cmd, 0, &[self.scissor]);
             for mesh in meshes {
                 let push_constants = PushConstants {
-                    world_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
-                    vertex_buffer: mesh.vertex_address
+                    world_matrix: world.to_cols_array_2d(),
+                    vertex_buffer: mesh.mem.as_ref().unwrap().vertex_address,
                 };
                 device.cmd_push_constants(
                     cmd,
@@ -130,8 +152,8 @@ impl MeshPipeline {
                     0,
                     bytemuck::cast_slice(&[push_constants]),
                 );
-                device.cmd_bind_index_buffer(cmd, mesh.index_buffer.buffer, 0, vk::IndexType::UINT32);
-                device.cmd_draw_indexed(cmd, 6, 1, 0, 0,0);
+                device.cmd_bind_index_buffer(cmd, mesh.mem.as_ref().unwrap().index_buffer.buffer, 0, vk::IndexType::UINT32);
+                device.cmd_draw_indexed(cmd, mesh.indices.len() as u32, 1, 0, 0, 0);
             }
             device.cmd_end_rendering(cmd);
         }
