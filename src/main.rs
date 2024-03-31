@@ -9,9 +9,9 @@ use ash::extensions::khr::{Surface, Swapchain};
 
 use crate::pipeline::mesh::MeshPipeline;
 use crate::pipeline::{PipelineBuilder, Vertex};
-use crate::resources::{AllocUsage, AllocatedBuffer, AllocatedImage, Allocator, DescriptorAllocator, DescriptorWriter, PoolSizeRatio};
+use crate::resources::{AllocUsage, AllocatedBuffer, AllocatedImage, Allocator, DescriptorAllocator, PoolSizeRatio, TextureManager, DescriptorImageWriteInfo, update_set, DescriptorBufferWriteInfo};
 use crate::util::{device_discovery, DeletionQueue, DescriptorLayoutBuilder, GpuSceneData};
-use ash::vk::Sampler;
+use ash::vk::{DescriptorSet, DescriptorSetLayout, Sampler};
 use ash::{vk, Device, Instance};
 use glam::{Vec2, Vec3};
 use gpu_alloc::GpuAllocator;
@@ -63,6 +63,8 @@ struct App {
     scene_data_layout: vk::DescriptorSetLayout,
     images: Vec<AllocatedImage>,
     samplers: Vec<vk::Sampler>,
+    bindless_descriptor_set: vk::DescriptorSet,
+    texture_manager: TextureManager,
 }
 
 #[derive(Default)]
@@ -87,6 +89,8 @@ pub struct Mesh {
 pub const SWAPCHAIN_IMAGE_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 pub const API_VERSION: u32 = vk::make_api_version(0, 1, 3, 0);
+
+type ImmediateSubmitFn<'a> = Box<dyn (Fn(&mut App, vk::CommandBuffer) -> Box<dyn (FnOnce(&Device, &mut Allocator))>) + 'a>;
 
 impl App {
     fn new(event_loop: &EventLoop<()>) -> Result<Self, Box<dyn Error>> {
@@ -127,7 +131,8 @@ impl App {
             Self::init_commands(graphics_queue.1, &device, &mut deletion_queue);
         let (descriptor_allocator, draw_image_descriptor_set_layout, draw_image_descriptor_set, scene_data_layout) =
             Self::init_descriptors(&device, draw_image.view, &mut deletion_queue);
-        let mesh_pipeline = MeshPipeline::new(&device, window_size, &mut deletion_queue);
+        let (bindless_descriptor_set, bindless_set_layout) = Self::init_bindless(&device);
+        let mesh_pipeline = MeshPipeline::new(&device, window_size, &mut deletion_queue, bindless_set_layout);
 
         Ok(App {
             entry,
@@ -168,6 +173,8 @@ impl App {
             },
             images: vec![],
             samplers: vec![],
+            bindless_descriptor_set,
+            texture_manager: TextureManager::new(),
         })
     }
 
@@ -181,7 +188,6 @@ impl App {
         let (graphics_family_index, present_family_index) = device_discovery::find_queue_families(instance, surface, surface_khr, device);
         let graphics_family_index = graphics_family_index.unwrap();
         let present_family_index = present_family_index.unwrap();
-        let queue_priorities = [1.0f32];
 
         let queue_create_infos = {
             // Vulkan specs does not allow passing an array containing duplicated family indices.
@@ -192,6 +198,7 @@ impl App {
 
             // Now we build an array of `DeviceQueueCreateInfo`.
             // One for each different family index.
+            let queue_priorities = [1.0f32];
             indices
                 .iter()
                 .map(|index| {
@@ -207,6 +214,14 @@ impl App {
         let mut vk12_features = vk::PhysicalDeviceVulkan12Features::builder()
             .buffer_device_address(true)
             .descriptor_indexing(true)
+            .runtime_descriptor_array(true)
+            .descriptor_binding_partially_bound(true)
+            .shader_storage_buffer_array_non_uniform_indexing(true)
+            .shader_storage_image_array_non_uniform_indexing(true)
+            .shader_sampled_image_array_non_uniform_indexing(true)
+            .descriptor_binding_storage_buffer_update_after_bind(true)
+            .descriptor_binding_storage_image_update_after_bind(true)
+            .descriptor_binding_sampled_image_update_after_bind(true)
             .build();
         let mut vk13_features = vk::PhysicalDeviceVulkan13Features::builder()
             .synchronization2(true)
@@ -410,6 +425,83 @@ impl App {
         )
     }
 
+    fn init_bindless(device: &Device) -> (DescriptorSet, DescriptorSetLayout) {
+        let pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 65536,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 65536,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: 65536,
+            },
+        ];
+        let descriptor_pool = unsafe {
+            device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::builder()
+                        .pool_sizes(&pool_sizes)
+                        .max_sets(1)
+                        .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
+                    None,
+                )
+                .unwrap()
+        };
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(65536)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(65536)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(65536)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
+        ];
+
+        let set_layout = unsafe {
+            device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::builder()
+                        .bindings(&bindings)
+                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+                        .push_next(&mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::builder().binding_flags(&[
+                            vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                            vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                            vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                        ])),
+                    None,
+                )
+                .unwrap()
+        };
+
+        (
+            unsafe {
+                device
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::builder()
+                            .descriptor_pool(descriptor_pool)
+                            .set_layouts(&[set_layout]),
+                    )
+                    .unwrap()[0]
+            },
+            set_layout,
+        )
+    }
+
     fn init_descriptors(
         device: &Device,
         draw_image: vk::ImageView,
@@ -428,15 +520,17 @@ impl App {
         let builder = DescriptorLayoutBuilder::default().add_binding(0, vk::DescriptorType::STORAGE_IMAGE, vk::ShaderStageFlags::COMPUTE);
         let layout = builder.build(device);
         let descriptor_set = descriptor_pool.allocate(device, layout);
-        let mut writer = DescriptorWriter::default();
-        writer.write_image(
-            0,
-            draw_image,
-            vk::Sampler::null(),
-            vk::ImageLayout::GENERAL,
-            vk::DescriptorType::STORAGE_IMAGE,
-        );
-        writer.update_set(device, descriptor_set);
+
+        update_set(device, descriptor_set, &[
+            DescriptorImageWriteInfo {
+                binding: 0,
+                array_index: 0,
+                image_view: draw_image,
+                sampler: vk::Sampler::null(),
+                layout: vk::ImageLayout::GENERAL,
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+            },
+        ], &[]);
         let scene_info_builder = DescriptorLayoutBuilder::default().add_binding(
             0,
             vk::DescriptorType::UNIFORM_BUFFER,
@@ -448,76 +542,6 @@ impl App {
             device.destroy_descriptor_set_layout(scene_info_layout, None);
         });
         (descriptor_pool, layout, descriptor_set, scene_info_layout)
-    }
-
-    fn init_textures(&mut self) {
-        let white = [255u8, 255, 255, 255];
-        let white_img = AllocatedImage::new(
-            &self.device,
-            &mut self.allocator,
-            vk::Extent3D {
-                width: 1,
-                height: 1,
-                depth: 1,
-            },
-            vk::Format::R8G8B8A8_UNORM,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-            AllocUsage::GpuOnly,
-            vk::ImageAspectFlags::COLOR,
-            Some("White Image".into()),
-        );
-        self.immediate_submit(white_img.write(&white));
-
-        let black = [0u8, 0, 0, 255];
-        let black_img = AllocatedImage::new(
-            &self.device,
-            &mut self.allocator,
-            vk::Extent3D {
-                width: 1,
-                height: 1,
-                depth: 1,
-            },
-            vk::Format::R8G8B8A8_UNORM,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-            AllocUsage::GpuOnly,
-            vk::ImageAspectFlags::COLOR,
-            Some("Black Image".into()),
-        );
-        self.immediate_submit(black_img.write(&black));
-
-        let magenta = [255u8, 0, 255, 255];
-        let pixels: [[u8; 4]; 16 * 16] = core::array::from_fn(|i| if i % 2 == 0 { magenta } else { white });
-        let checkerboard_img = AllocatedImage::new(
-            &self.device,
-            &mut self.allocator,
-            vk::Extent3D {
-                width: 16,
-                height: 16,
-                depth: 1,
-            },
-            vk::Format::R8G8B8A8_UNORM,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-            AllocUsage::GpuOnly,
-            vk::ImageAspectFlags::COLOR,
-            Some("Checkerboard Image".into()),
-        );
-        let pixel_data = pixels.iter().flat_map(|p| p.iter().copied()).collect::<Vec<_>>();
-        self.immediate_submit(checkerboard_img.write(&pixel_data));
-
-        let sampler_info = vk::SamplerCreateInfo::builder()
-            .mag_filter(vk::Filter::NEAREST)
-            .min_filter(vk::Filter::NEAREST);
-        let sampler_nearest = unsafe { self.device.create_sampler(&sampler_info, None).unwrap() };
-        let sampler_info = vk::SamplerCreateInfo::builder()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR);
-        let sampler_linear = unsafe { self.device.create_sampler(&sampler_info, None).unwrap() };
-
-        self.images.push(white_img);
-        self.images.push(black_img);
-        self.images.push(checkerboard_img);
-        self.samplers.push(sampler_nearest);
-        self.samplers.push(sampler_linear);
     }
 
     unsafe fn destroy_swapchain(&mut self) {
@@ -650,10 +674,7 @@ impl App {
     }
 
     // https://i.imgflip.com/8l3uzz.jpg
-    fn immediate_submit<'a>(
-        &'a mut self,
-        cmd: Box<dyn (Fn(&mut Self, vk::CommandBuffer) -> Box<dyn (FnOnce(&Device, &mut Allocator))>) + 'a>,
-    ) {
+    fn immediate_submit<'a>(&'a mut self, cmd: ImmediateSubmitFn<'a>) {
         let cmd_buffer = self.immediate_command_buffer;
         unsafe {
             self.device.reset_fences(&[self.immediate_fence]).unwrap();
@@ -677,6 +698,40 @@ impl App {
     }
     fn current_frame(&self) -> &FrameData {
         &self.frames[(self.current_frame % FRAME_OVERLAP as u32) as usize]
+    }
+
+    fn init_textures(&mut self) {
+        self.texture_manager.init_defaults(
+            &self.device,
+            &mut self.allocator,
+            self.bindless_descriptor_set,
+            &mut self.main_deletion_queue,
+        );
+        self.immediate_submit(Box::new(move |this: &mut App, cmd: vk::CommandBuffer| {
+            let white = [255u8, 255, 255, 255];
+            let black = [0u8, 0, 0, 255];
+            let magenta = [255u8, 0, 255, 255];
+            let pixels: [[u8; 4]; 16 * 16] = core::array::from_fn(|i| if i % 2 == 0 { magenta } else { white });
+            let pixel_data = pixels.iter().flat_map(|p| p.iter().copied()).collect::<Vec<_>>();
+
+            let cleanup_white = this.texture_manager.textures[0]
+                .image
+                .write(&white, &this.device, &mut this.allocator, cmd);
+
+            let cleanup_black = this.texture_manager.textures[1]
+                .image
+                .write(&black, &this.device, &mut this.allocator, cmd);
+
+            let cleanup_checkerboard = this.texture_manager.textures[2]
+                .image
+                .write(&pixel_data, &this.device, &mut this.allocator, cmd);
+
+            Box::new(move |device: &Device, allocator: &mut Allocator| {
+                cleanup_white(device, allocator);
+                cleanup_black(device, allocator);
+                cleanup_checkerboard(device, allocator);
+            })
+        }));
     }
 
     fn draw(&mut self) {
@@ -756,15 +811,18 @@ impl App {
             let scene_data_ptr = map.as_ptr() as *mut GpuSceneData;
             scene_data_ptr.copy_from_nonoverlapping(&self.scene_data, 1);
             let global_descriptor = frame!(self).descriptor_allocator.allocate(&self.device, self.scene_data_layout);
-            let mut writer = DescriptorWriter::default();
-            writer.write_buffer(
-                0,
-                scene_data_buffer.buffer,
-                std::mem::size_of::<GpuSceneData>() as vk::DeviceSize,
-                0,
-                vk::DescriptorType::UNIFORM_BUFFER,
-            );
-            writer.update_set(&self.device, global_descriptor);
+            
+            update_set(&self.device, global_descriptor, &[], &[
+                DescriptorBufferWriteInfo {
+                    binding: 0,
+                    array_index: 0,
+                    buffer: scene_data_buffer.buffer,
+                    size: std::mem::size_of::<GpuSceneData>() as vk::DeviceSize,
+                    offset: 0,
+                    ty: vk::DescriptorType::UNIFORM_BUFFER,
+                }
+            ]);
+            
             frame!(self).stale_buffers.push(scene_data_buffer);
 
             self.mesh_pipeline.draw(
@@ -773,6 +831,7 @@ impl App {
                 &self.meshes,
                 self.draw_image.as_ref().unwrap().view,
                 self.depth_image.as_ref().unwrap().view,
+                self.bindless_descriptor_set,
             );
 
             // prepare copying of the draw image to the swapchain image
@@ -921,7 +980,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         mesh.mem = Some(gpu);
         app.meshes.push(mesh);
     }
-
     app.init_textures();
 
     event_loop.run(move |event, _, control_flow| match event {

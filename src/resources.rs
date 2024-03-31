@@ -1,6 +1,6 @@
 use crate::pipeline::Vertex;
-use crate::util::transition_image;
-use crate::App;
+use crate::util::{DeletionQueue, transition_image};
+use crate::{App, ImmediateSubmitFn};
 use ash::prelude::VkResult;
 use ash::vk::{DeviceMemory, DeviceSize};
 use ash::{vk, Device};
@@ -107,72 +107,61 @@ impl DescriptorAllocator {
     }
 }
 
-#[derive(Default)]
-pub struct DescriptorWriter<'a> {
-    image_infos: Vec<([vk::DescriptorImageInfo; 1], u32, vk::DescriptorType)>,
-    buffer_infos: Vec<([vk::DescriptorBufferInfo; 1], u32, vk::DescriptorType)>,
-    writes: Vec<vk::WriteDescriptorSetBuilder<'a>>,
+pub struct DescriptorBufferWriteInfo {
+    pub binding: u32,
+    pub array_index: u32,
+    pub buffer: vk::Buffer,
+    pub size: vk::DeviceSize,
+    pub offset: vk::DeviceSize,
+    pub ty: vk::DescriptorType,
 }
-impl DescriptorWriter<'_> {
-    pub fn write_buffer(&mut self, binding: u32, buffer: vk::Buffer, size: vk::DeviceSize, offset: vk::DeviceSize, ty: vk::DescriptorType) {
-        self.buffer_infos.push((
-            [vk::DescriptorBufferInfo::builder()
-                .buffer(buffer)
-                .offset(offset)
-                .range(size)
-                .build()],
-            binding,
-            ty,
-        ));
-    }
 
-    pub fn write_image(
-        &mut self,
-        binding: u32,
-        image_view: vk::ImageView,
-        sampler: vk::Sampler,
-        layout: vk::ImageLayout,
-        ty: vk::DescriptorType,
-    ) {
-        self.image_infos.push((
-            [vk::DescriptorImageInfo::builder()
-                .image_view(image_view)
-                .sampler(sampler)
-                .image_layout(layout)
-                .build()],
-            binding,
-            ty,
-        ));
-    }
+pub struct DescriptorImageWriteInfo {
+    pub binding: u32,
+    pub array_index: u32,
+    pub image_view: vk::ImageView,
+    pub sampler: vk::Sampler,
+    pub layout: vk::ImageLayout,
+    pub ty: vk::DescriptorType,
+}
 
-    pub fn update_set(mut self, device: &Device, set: vk::DescriptorSet) {
-        let mut writes = vec![];
-        for (buffer_info, binding, ty) in self.buffer_infos {
-            writes.push(
-                vk::WriteDescriptorSet::builder()
-                    .dst_binding(binding)
-                    .dst_array_element(0)
-                    .descriptor_type(ty)
-                    .buffer_info(&buffer_info)
-                    .build(), // TODO this is super sketchy
-            );
-        }
-        for (image_info, binding, ty) in self.image_infos {
-            writes.push(
-                vk::WriteDescriptorSet::builder()
-                    .dst_binding(binding)
-                    .dst_array_element(0)
-                    .descriptor_type(ty)
-                    .image_info(&image_info)
-                    .build(), // TODO this is super sketchy
-            );
-        }
-
-        for write in self.writes.as_mut_slice() {
-            write.dst_set = set;
-        }
-        unsafe { device.update_descriptor_sets(&self.writes.into_iter().map(|x| x.build()).collect::<Vec<_>>(), &[]) }
+pub fn update_set(device: &Device, set: vk::DescriptorSet, image_writes: &[DescriptorImageWriteInfo], buffer_writes: &[DescriptorBufferWriteInfo]) {
+    let mut writes = vec![];
+    let buffer_infos = buffer_writes.iter().map(|write| [vk::DescriptorBufferInfo {
+        buffer: write.buffer,
+        offset: write.offset,
+        range: write.size,
+    }]).collect::<Vec<_>>();
+    for (i, write) in buffer_writes.iter().enumerate() {
+        writes.push(
+            vk::WriteDescriptorSet::builder()
+                .dst_binding(write.binding)
+                .dst_set(set)
+                .dst_array_element(write.array_index)
+                .descriptor_type(write.ty)
+                .buffer_info(&buffer_infos[i])
+        );
     }
+    let image_infos = image_writes.iter().map(|write| [vk::DescriptorImageInfo {
+        image_view: write.image_view,
+        sampler: write.sampler,
+        image_layout: write.layout,
+    }]).collect::<Vec<_>>();
+    for (i, write) in image_writes.iter().enumerate() {
+
+        writes.push(
+            vk::WriteDescriptorSet::builder()
+                .dst_binding(write.binding)
+                .dst_set(set)
+                .dst_array_element(write.array_index)
+                .descriptor_type(write.ty)
+                .image_info(&image_infos[i])
+        );
+    }
+    
+    // println!("Writes: {:#?}", writes);
+
+    unsafe { device.update_descriptor_sets(&writes.into_iter().map(|x| x.build()).collect::<Vec<_>>(), &[]) }
 }
 
 pub struct AllocatedBuffer {
@@ -355,14 +344,10 @@ impl AllocatedImage {
     }
 
     // https://i.imgflip.com/8l3uzz.jpg
-    pub fn write<'a>(
-        &'a self,
-        data: &'a [u8],
-    ) -> Box<dyn (Fn(&mut App, vk::CommandBuffer) -> Box<dyn (FnOnce(&Device, &mut Allocator))>) + 'a> {
-        Box::new(move |this, cmd| {
+    pub fn write<'a>(&'a self, data: &'a [u8], device: &Device, allocator: &mut Allocator, cmd: vk::CommandBuffer) -> Box<dyn (FnOnce(&Device, &mut Allocator))> {
             let mut staging = AllocatedBuffer::new(
-                &this.device,
-                &mut this.allocator,
+                device,
+                allocator,
                 vk::BufferUsageFlags::TRANSFER_SRC,
                 AllocUsage::UploadToHost,
                 data.len() as DeviceSize,
@@ -371,12 +356,12 @@ impl AllocatedImage {
             unsafe {
                 let data_ptr = staging
                     .allocation
-                    .map(AshMemoryDevice::wrap(&this.device), 0, staging.size as usize)
+                    .map(AshMemoryDevice::wrap(device), 0, staging.size as usize)
                     .unwrap();
                 std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr.as_ptr(), data.len());
             }
             transition_image(
-                &this.device,
+                device,
                 cmd,
                 self.image,
                 vk::ImageLayout::UNDEFINED,
@@ -397,7 +382,7 @@ impl AllocatedImage {
                 .image_extent(self.extent);
             let copy_regions = [*copy_region];
             unsafe {
-                this.device.cmd_copy_buffer_to_image(
+                device.cmd_copy_buffer_to_image(
                     cmd,
                     staging.buffer,
                     self.image,
@@ -406,7 +391,7 @@ impl AllocatedImage {
                 );
             }
             transition_image(
-                &this.device,
+                device,
                 cmd,
                 self.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -415,7 +400,6 @@ impl AllocatedImage {
             Box::from(|device: &Device, allocator: &mut Allocator| {
                 staging.destroy(device, allocator);
             })
-        })
     }
 
     pub(crate) fn destroy(self, device: &Device, allocator: &mut Allocator) {
@@ -431,5 +415,131 @@ impl AllocatedImage {
         unsafe { device.destroy_image_view(self.view, None) };
         unsafe { device.destroy_image(self.image, None) };
         unsafe { allocator.dealloc(AshMemoryDevice::wrap(device), self.allocation) };
+    }
+}
+
+pub struct Texture {
+    pub image: AllocatedImage,
+}
+
+pub struct TextureManager {
+    pub textures: Vec<Texture>,
+    pub samplers: Vec<vk::Sampler>,
+}
+
+impl TextureManager {
+    pub fn new() -> Self {
+        Self {
+            textures: vec![],
+            samplers: vec![],
+        }
+    }
+
+    pub fn add_texture(&mut self, texture: AllocatedImage) {
+        self.textures.push(Texture { image: texture });
+    }
+
+    pub fn destroy(self, device: &Device, allocator: &mut Allocator) {
+        for texture in self.textures {
+            texture.image.destroy(device, allocator);
+        }
+    }
+
+    pub fn init_defaults(
+        &mut self,
+        device: &Device,
+        allocator: &mut Allocator,
+        bindless_descriptor_set: vk::DescriptorSet,
+        deletion_queue: &mut DeletionQueue,
+    ) {
+        let white_img = AllocatedImage::new(
+            device,
+            allocator,
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            AllocUsage::GpuOnly,
+            vk::ImageAspectFlags::COLOR,
+            Some("White Image".into()),
+        );
+        let black_img = AllocatedImage::new(
+            device,
+            allocator,
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            AllocUsage::GpuOnly,
+            vk::ImageAspectFlags::COLOR,
+            Some("Black Image".into()),
+        );
+        let checkerboard_img = AllocatedImage::new(
+            device,
+            allocator,
+            vk::Extent3D {
+                width: 16,
+                height: 16,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            AllocUsage::GpuOnly,
+            vk::ImageAspectFlags::COLOR,
+            Some("Checkerboard Image".into()),
+        );
+        let sampler_info = vk::SamplerCreateInfo::builder()
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST);
+        let sampler_nearest = unsafe { device.create_sampler(&sampler_info, None).unwrap() };
+        let sampler_info = vk::SamplerCreateInfo::builder()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR);
+        let sampler_linear = unsafe { device.create_sampler(&sampler_info, None).unwrap() };
+
+        update_set(device, bindless_descriptor_set, &[
+            DescriptorImageWriteInfo {
+                binding: 2,
+                array_index: 0,
+                image_view: white_img.view,
+                sampler: sampler_nearest,
+                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            },
+            DescriptorImageWriteInfo {
+                binding: 2,
+                array_index: 1,
+                image_view: black_img.view,
+                sampler: sampler_nearest,
+                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            },
+            DescriptorImageWriteInfo {
+                binding: 2,
+                array_index: 2,
+                image_view: checkerboard_img.view,
+                sampler: sampler_nearest,
+                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            },
+        ], &[]);
+
+        self.textures.push(Texture { image: white_img });
+        self.textures.push(Texture { image: black_img });
+        self.textures.push(Texture { image: checkerboard_img });
+        self.samplers.push(sampler_nearest);
+        self.samplers.push(sampler_linear);
+        deletion_queue.push(move |device| {
+            unsafe {
+                device.destroy_sampler(sampler_nearest, None);
+                device.destroy_sampler(sampler_linear, None);
+            }
+        });
     }
 }
