@@ -1,16 +1,19 @@
 extern crate core;
 
+mod gltf;
 mod pipeline;
 mod resources;
 mod util;
-mod gltf;
 
 use ash::extensions::khr::{Surface, Swapchain};
 
+use crate::pipeline::mesh::MeshPipeline;
 use crate::pipeline::{PipelineBuilder, Vertex};
-use crate::resources::{AllocUsage, AllocatedBuffer, AllocatedImage, Allocator, DescriptorAllocator, PoolSizeRatio, DescriptorWriter};
+use crate::resources::{AllocUsage, AllocatedBuffer, AllocatedImage, Allocator, DescriptorAllocator, DescriptorWriter, PoolSizeRatio};
 use crate::util::{device_discovery, DeletionQueue, DescriptorLayoutBuilder, GpuSceneData};
+use ash::vk::Sampler;
 use ash::{vk, Device, Instance};
+use glam::{Vec2, Vec3};
 use gpu_alloc::GpuAllocator;
 use gpu_alloc_ash::{device_properties, AshMemoryDevice};
 use log::{debug, info};
@@ -18,7 +21,6 @@ use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 use std::error::Error;
 use std::ffi::CStr;
 use std::path::Path;
-use glam::{Vec2, Vec3};
 use util::FrameData;
 use winit::{
     dpi::PhysicalSize,
@@ -26,7 +28,6 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
-use crate::pipeline::mesh::MeshPipeline;
 
 const FRAME_OVERLAP: usize = 2;
 
@@ -60,6 +61,8 @@ struct App {
     meshes: Vec<Mesh>,
     scene_data: GpuSceneData,
     scene_data_layout: vk::DescriptorSetLayout,
+    images: Vec<AllocatedImage>,
+    samplers: Vec<vk::Sampler>,
 }
 
 #[derive(Default)]
@@ -81,13 +84,11 @@ pub struct Mesh {
     pub(crate) uvs: Vec<Vec2>,
 }
 
-
 pub const SWAPCHAIN_IMAGE_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 pub const API_VERSION: u32 = vk::make_api_version(0, 1, 3, 0);
 
 impl App {
-
     fn new(event_loop: &EventLoop<()>) -> Result<Self, Box<dyn Error>> {
         let window_size = (800, 600);
         let (instance, surface_khr, surface, entry, window) = unsafe {
@@ -122,7 +123,8 @@ impl App {
         let capabilities = unsafe { surface.get_physical_device_surface_capabilities(physical_device, surface_khr) }?;
         let ((swapchain, swapchain_khr), swapchain_images, swapchain_views, draw_image, depth_image) =
             Self::create_swapchain(&instance, &device, surface_khr, capabilities, &mut allocator, window_size);
-        let (immediate_command_pool, immediate_command_buffer, immediate_fence, frames) = Self::init_commands(graphics_queue.1, &device, &mut deletion_queue);
+        let (immediate_command_pool, immediate_command_buffer, immediate_fence, frames) =
+            Self::init_commands(graphics_queue.1, &device, &mut deletion_queue);
         let (descriptor_allocator, draw_image_descriptor_set_layout, draw_image_descriptor_set, scene_data_layout) =
             Self::init_descriptors(&device, draw_image.view, &mut deletion_queue);
         let mesh_pipeline = MeshPipeline::new(&device, window_size, &mut deletion_queue);
@@ -145,29 +147,27 @@ impl App {
             window_size,
             allocator,
             main_deletion_queue: deletion_queue,
-            draw_image: Some(draw_image),  // must be present at all times, Option<_> because we need ownership when destroying
+            draw_image: Some(draw_image), // must be present at all times, Option<_> because we need ownership when destroying
             depth_image: Some(depth_image),
             descriptor_allocator,
             draw_image_descriptor_set,
             draw_image_descriptor_set_layout,
             mesh_pipeline,
             immediate_command_pool,
-            immediate_command_buffer, 
+            immediate_command_buffer,
             immediate_fence,
             meshes: vec![],
             scene_data_layout,
             scene_data: GpuSceneData {
-                view: glam::Mat4::look_at_rh(
-                    Vec3::new(0.0, 0.0, 3.0),
-                    Vec3::new(0.0, 0.0, 0.0),
-                    Vec3::new(0.0, 1.0, 0.0),
-                ),
+                view: glam::Mat4::look_at_rh(Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)),
                 proj: glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, window_size.0 as f32 / window_size.1 as f32, 0.1, 100.0), // Todo update proj
                 viewproj: Default::default(),
                 ambient_color: Default::default(),
                 sun_dir: Default::default(),
                 sun_color: Default::default(),
-            }
+            },
+            images: vec![],
+            samplers: vec![],
         })
     }
 
@@ -245,7 +245,13 @@ impl App {
         capabilities: vk::SurfaceCapabilitiesKHR,
         allocator: &mut Allocator,
         window_size: (u32, u32),
-    ) -> ((Swapchain, vk::SwapchainKHR), Vec<vk::Image>, Vec<vk::ImageView>, AllocatedImage, AllocatedImage) {
+    ) -> (
+        (Swapchain, vk::SwapchainKHR),
+        Vec<vk::Image>,
+        Vec<vk::ImageView>,
+        AllocatedImage,
+        AllocatedImage,
+    ) {
         let create_info = vk::SwapchainCreateInfoKHR {
             surface: surface_khr,
             image_format: SWAPCHAIN_IMAGE_FORMAT,
@@ -292,7 +298,7 @@ impl App {
             .collect::<Vec<_>>();
 
         let draw_image = AllocatedImage::new(
-            device.clone(),
+            &device,
             allocator,
             vk::Extent3D {
                 width: window_size.0,
@@ -306,11 +312,11 @@ impl App {
                 | vk::ImageUsageFlags::COLOR_ATTACHMENT,
             AllocUsage::GpuOnly,
             vk::ImageAspectFlags::COLOR,
-            Some("Draw Image".into())
+            Some("Draw Image".into()),
         );
-        
+
         let depth_image = AllocatedImage::new(
-            device.clone(),
+            &device,
             allocator,
             vk::Extent3D {
                 width: window_size.0,
@@ -321,13 +327,17 @@ impl App {
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             AllocUsage::GpuOnly,
             vk::ImageAspectFlags::DEPTH,
-            Some("Depth Image".into())
+            Some("Depth Image".into()),
         );
 
         ((swapchain, swapchain_khr), images, image_views, draw_image, depth_image)
     }
 
-    fn init_commands(queue_family_index: u32, device: &Device, deletion_queue: &mut DeletionQueue) -> (vk::CommandPool, vk::CommandBuffer, vk::Fence, [FrameData; FRAME_OVERLAP]) {
+    fn init_commands(
+        queue_family_index: u32,
+        device: &Device,
+        deletion_queue: &mut DeletionQueue,
+    ) -> (vk::CommandPool, vk::CommandBuffer, vk::Fence, [FrameData; FRAME_OVERLAP]) {
         let command_pool_create_info = vk::CommandPoolCreateInfo::builder()
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER) // we want to be able to reset individual command buffers, not the entire pool at once
             .queue_family_index(queue_family_index);
@@ -341,11 +351,9 @@ impl App {
             .command_buffer_count(1);
         let immediate_command_buffer = unsafe { device.allocate_command_buffers(&immediate_alloc_info).unwrap()[0] };
         let immediate_fence = unsafe { device.create_fence(&fence_create_info, None).unwrap() };
-        deletion_queue.push(move |device| {
-            unsafe {
-                device.destroy_command_pool(immediate_command_pool, None);
-                device.destroy_fence(immediate_fence, None);
-            }
+        deletion_queue.push(move |device| unsafe {
+            device.destroy_command_pool(immediate_command_pool, None);
+            device.destroy_fence(immediate_fence, None);
         });
         (
             immediate_command_pool,
@@ -374,31 +382,44 @@ impl App {
                     render_semaphore,
                     render_fence,
                     deletion_queue: DeletionQueue::default(),
-                    descriptor_allocator: DescriptorAllocator::new(device, 1000, &[
-                        PoolSizeRatio {
-                            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
-                            ratio: 3.0,
-                        },
-                        PoolSizeRatio {
-                            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-                            ratio: 3.0,
-                        },
-                        PoolSizeRatio {
-                            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-                            ratio: 3.0,
-                        },
-                        PoolSizeRatio {
-                            descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            ratio: 4.0,
-                        },
-                    ]),
+                    descriptor_allocator: DescriptorAllocator::new(
+                        device,
+                        1000,
+                        &[
+                            PoolSizeRatio {
+                                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                                ratio: 3.0,
+                            },
+                            PoolSizeRatio {
+                                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                                ratio: 3.0,
+                            },
+                            PoolSizeRatio {
+                                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                                ratio: 3.0,
+                            },
+                            PoolSizeRatio {
+                                descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                                ratio: 4.0,
+                            },
+                        ],
+                    ),
                     stale_buffers: Vec::new(),
                 }
             }),
         )
     }
 
-    fn init_descriptors(device: &Device, draw_image: vk::ImageView, deletion_queue: &mut DeletionQueue) -> (DescriptorAllocator, vk::DescriptorSetLayout, vk::DescriptorSet, vk::DescriptorSetLayout) {
+    fn init_descriptors(
+        device: &Device,
+        draw_image: vk::ImageView,
+        deletion_queue: &mut DeletionQueue,
+    ) -> (
+        DescriptorAllocator,
+        vk::DescriptorSetLayout,
+        vk::DescriptorSet,
+        vk::DescriptorSetLayout,
+    ) {
         let sizes = [PoolSizeRatio {
             descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
             ratio: 1.0,
@@ -408,19 +429,97 @@ impl App {
         let layout = builder.build(device);
         let descriptor_set = descriptor_pool.allocate(device, layout);
         let mut writer = DescriptorWriter::default();
-        writer.write_image(0, draw_image, vk::Sampler::null(), vk::ImageLayout::GENERAL, vk::DescriptorType::STORAGE_IMAGE);
+        writer.write_image(
+            0,
+            draw_image,
+            vk::Sampler::null(),
+            vk::ImageLayout::GENERAL,
+            vk::DescriptorType::STORAGE_IMAGE,
+        );
         writer.update_set(device, descriptor_set);
-        let scene_info_builder = DescriptorLayoutBuilder::default().add_binding(0, vk::DescriptorType::UNIFORM_BUFFER, vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT);
+        let scene_info_builder = DescriptorLayoutBuilder::default().add_binding(
+            0,
+            vk::DescriptorType::UNIFORM_BUFFER,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+        );
         let scene_info_layout = scene_info_builder.build(device);
-        deletion_queue.push(move |device| {
-            unsafe {
-                device.destroy_descriptor_set_layout(layout, None);
-                device.destroy_descriptor_set_layout(scene_info_layout, None);
-                // device.destroy_descriptor_pool(pool, None);
-            }
+        deletion_queue.push(move |device| unsafe {
+            device.destroy_descriptor_set_layout(layout, None);
+            device.destroy_descriptor_set_layout(scene_info_layout, None);
         });
         (descriptor_pool, layout, descriptor_set, scene_info_layout)
     }
+
+    fn init_textures(&mut self) {
+        let white = [255u8, 255, 255, 255];
+        let white_img = AllocatedImage::new(
+            &self.device,
+            &mut self.allocator,
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            AllocUsage::GpuOnly,
+            vk::ImageAspectFlags::COLOR,
+            Some("White Image".into()),
+        );
+        self.immediate_submit(white_img.write(&white));
+
+        let black = [0u8, 0, 0, 255];
+        let black_img = AllocatedImage::new(
+            &self.device,
+            &mut self.allocator,
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            AllocUsage::GpuOnly,
+            vk::ImageAspectFlags::COLOR,
+            Some("Black Image".into()),
+        );
+        self.immediate_submit(black_img.write(&black));
+
+        let magenta = [255u8, 0, 255, 255];
+        let pixels: [[u8; 4]; 16 * 16] = core::array::from_fn(|i| if i % 2 == 0 { magenta } else { white });
+        let checkerboard_img = AllocatedImage::new(
+            &self.device,
+            &mut self.allocator,
+            vk::Extent3D {
+                width: 16,
+                height: 16,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            AllocUsage::GpuOnly,
+            vk::ImageAspectFlags::COLOR,
+            Some("Checkerboard Image".into()),
+        );
+        let pixel_data = pixels.iter().flat_map(|p| p.iter().copied()).collect::<Vec<_>>();
+        self.immediate_submit(checkerboard_img.write(&pixel_data));
+
+        let sampler_info = vk::SamplerCreateInfo::builder()
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST);
+        let sampler_nearest = unsafe { self.device.create_sampler(&sampler_info, None).unwrap() };
+        let sampler_info = vk::SamplerCreateInfo::builder()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR);
+        let sampler_linear = unsafe { self.device.create_sampler(&sampler_info, None).unwrap() };
+
+        self.images.push(white_img);
+        self.images.push(black_img);
+        self.images.push(checkerboard_img);
+        self.samplers.push(sampler_nearest);
+        self.samplers.push(sampler_linear);
+    }
+
     unsafe fn destroy_swapchain(&mut self) {
         self.swapchain.0.destroy_swapchain(self.swapchain.1, None);
         for view in self.swapchain_views.drain(..) {
@@ -434,34 +533,50 @@ impl App {
         self.mesh_pipeline.resize(size);
     }
     fn resize_swapchain(&mut self, size: (u32, u32)) {
-        unsafe { 
+        unsafe {
             self.device.device_wait_idle().unwrap();
             self.destroy_swapchain();
             self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator);
             self.depth_image.take().unwrap().destroy(&self.device, &mut self.allocator);
         }
         self.window_size = size;
-        let capabilities = unsafe { self.surface_fn.get_physical_device_surface_capabilities(self.physical_device, self.surface).unwrap() };
-        let (swapchain, swapchain_images, swapchain_views, draw_image, depth_image) = 
-            Self::create_swapchain(&self.instance, &self.device, self.surface, capabilities, &mut self.allocator, self.window_size);
+        let capabilities = unsafe {
+            self.surface_fn
+                .get_physical_device_surface_capabilities(self.physical_device, self.surface)
+                .unwrap()
+        };
+        let (swapchain, swapchain_images, swapchain_views, draw_image, depth_image) = Self::create_swapchain(
+            &self.instance,
+            &self.device,
+            self.surface,
+            capabilities,
+            &mut self.allocator,
+            self.window_size,
+        );
         self.swapchain = swapchain;
         self.swapchain_images = swapchain_images;
         self.swapchain_views = swapchain_views;
         self.draw_image = Some(draw_image);
         self.depth_image = Some(depth_image);
     }
-    
+
     fn upload_mesh(&mut self, mesh: &Mesh) -> GpuMesh {
         info!("Uploading mesh to GPU");
         debug!("Mesh vertices: {:?}", mesh.vertices);
-        let vertices = mesh.vertices.iter().zip(mesh.normals.iter()).zip(mesh.uvs.iter()).map(|((vertex, normal), uv)| Vertex {
-            position: vertex.to_array(),
-            normal: normal.to_array(),
-            uv_x: uv.x,
-            uv_y: uv.y,
-            color: [0.4, 0.6, 0.3, 1.0],
-        }).collect::<Vec<_>>();
-        
+        let vertices = mesh
+            .vertices
+            .iter()
+            .zip(mesh.normals.iter())
+            .zip(mesh.uvs.iter())
+            .map(|((vertex, normal), uv)| Vertex {
+                position: vertex.to_array(),
+                normal: normal.to_array(),
+                uv_x: uv.x,
+                uv_y: uv.y,
+                color: [0.4, 0.6, 0.3, 1.0],
+            })
+            .collect::<Vec<_>>();
+
         let vertex_buffer_size = (vertices.len() * std::mem::size_of::<Vertex>()) as vk::DeviceSize;
         let index_buffer_size = (mesh.indices.len() * std::mem::size_of::<u32>()) as vk::DeviceSize;
         let vertex_buffer = AllocatedBuffer::new(
@@ -482,7 +597,6 @@ impl App {
             index_buffer_size,
             Some("Index Buffer".into()),
         );
-
 
         let mut staging = AllocatedBuffer::new(
             &self.device,
@@ -513,7 +627,8 @@ impl App {
                 size: vertex_buffer_size,
             };
             unsafe {
-                this.device.cmd_copy_buffer(cmd, staging.buffer, vertex_buffer.buffer, &[vertex_copy]);
+                this.device
+                    .cmd_copy_buffer(cmd, staging.buffer, vertex_buffer.buffer, &[vertex_copy]);
             };
             let index_copy = vk::BufferCopy {
                 src_offset: vertex_buffer_size,
@@ -523,6 +638,8 @@ impl App {
             unsafe {
                 this.device.cmd_copy_buffer(cmd, staging.buffer, index_buffer.buffer, &[index_copy]);
             };
+            // return empty FnOnce closure
+            Box::from(move |_: &Device, _: &mut Allocator| {})
         }));
         staging.destroy(&self.device, &mut self.allocator);
         GpuMesh {
@@ -531,7 +648,12 @@ impl App {
             index_buffer,
         }
     }
-    fn immediate_submit(&mut self, cmd: Box<dyn Fn(&mut Self, vk::CommandBuffer)>) {
+
+    // https://i.imgflip.com/8l3uzz.jpg
+    fn immediate_submit<'a>(
+        &'a mut self,
+        cmd: Box<dyn (Fn(&mut Self, vk::CommandBuffer) -> Box<dyn (FnOnce(&Device, &mut Allocator))>) + 'a>,
+    ) {
         let cmd_buffer = self.immediate_command_buffer;
         unsafe {
             self.device.reset_fences(&[self.immediate_fence]).unwrap();
@@ -540,7 +662,7 @@ impl App {
                 .unwrap();
             let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.device.begin_command_buffer(cmd_buffer, &begin_info).unwrap();
-            cmd(self, cmd_buffer);
+            let cleanup = cmd(self, cmd_buffer);
             self.device.end_command_buffer(cmd_buffer).unwrap();
             let cmd_buffer_submit = vk::CommandBufferSubmitInfo::builder().command_buffer(cmd_buffer);
             let cmd_buffer_submits = [*cmd_buffer_submit];
@@ -550,6 +672,7 @@ impl App {
                 .queue_submit2(self.graphics_queue.0, &submits, self.immediate_fence)
                 .unwrap();
             self.device.wait_for_fences(&[self.immediate_fence], true, 1000000000).unwrap();
+            cleanup(&self.device, &mut self.allocator);
         }
     }
     fn current_frame(&self) -> &FrameData {
@@ -615,7 +738,7 @@ impl App {
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
             );
-            
+
             let mut scene_data_buffer = AllocatedBuffer::new(
                 &self.device,
                 &mut self.allocator,
@@ -626,19 +749,31 @@ impl App {
             );
 
             let map = scene_data_buffer
-                    .allocation
-                    .map(AshMemoryDevice::wrap(&self.device), 0, std::mem::size_of::<GpuSceneData>())
-                    .unwrap();
+                .allocation
+                .map(AshMemoryDevice::wrap(&self.device), 0, std::mem::size_of::<GpuSceneData>())
+                .unwrap();
             // copy scene data to buffer
             let scene_data_ptr = map.as_ptr() as *mut GpuSceneData;
             scene_data_ptr.copy_from_nonoverlapping(&self.scene_data, 1);
             let global_descriptor = frame!(self).descriptor_allocator.allocate(&self.device, self.scene_data_layout);
             let mut writer = DescriptorWriter::default();
-            writer.write_buffer(0, scene_data_buffer.buffer, std::mem::size_of::<GpuSceneData>() as vk::DeviceSize, 0, vk::DescriptorType::UNIFORM_BUFFER);
+            writer.write_buffer(
+                0,
+                scene_data_buffer.buffer,
+                std::mem::size_of::<GpuSceneData>() as vk::DeviceSize,
+                0,
+                vk::DescriptorType::UNIFORM_BUFFER,
+            );
             writer.update_set(&self.device, global_descriptor);
             frame!(self).stale_buffers.push(scene_data_buffer);
 
-            self.mesh_pipeline.draw(&self.device, cmd_buffer, &self.meshes, self.draw_image.as_ref().unwrap().view, self.depth_image.as_ref().unwrap().view);
+            self.mesh_pipeline.draw(
+                &self.device,
+                cmd_buffer,
+                &self.meshes,
+                self.draw_image.as_ref().unwrap().view,
+                self.depth_image.as_ref().unwrap().view,
+            );
 
             // prepare copying of the draw image to the swapchain image
             util::transition_image(
@@ -745,12 +880,16 @@ impl Drop for App {
                 mem.vertex_buffer.destroy(&self.device, &mut self.allocator);
             }
 
-
             self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator);
             self.depth_image.take().unwrap().destroy(&self.device, &mut self.allocator);
-
+            for image in self.images.drain(..) {
+                image.destroy(&self.device, &mut self.allocator);
+            }
+            for sampler in self.samplers.drain(..) {
+                self.device.destroy_sampler(sampler, None);
+            }
             for frame in self.frames.iter_mut() {
-                frame.deletion_queue.flush(&self.device);  // take care of frames that were prepared but not reached in the render loop yet
+                frame.deletion_queue.flush(&self.device); // take care of frames that were prepared but not reached in the render loop yet
                 for buffer in frame.stale_buffers.drain(..) {
                     buffer.destroy(&self.device, &mut self.allocator);
                 }
@@ -783,6 +922,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         app.meshes.push(mesh);
     }
 
+    app.init_textures();
+
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent {
             event:
@@ -800,7 +941,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             *control_flow = ControlFlow::Exit;
         }
         Event::WindowEvent {
-            event: WindowEvent::Resized(size), ..
+            event: WindowEvent::Resized(size),
+            ..
         } => {
             app.resize((size.width, size.height));
         }

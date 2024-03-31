@@ -1,8 +1,8 @@
 pub mod mesh;
 
-use ash::{Device, vk};
-use bytemuck::{Pod, Zeroable};
 use crate::{DEPTH_FORMAT, SWAPCHAIN_IMAGE_FORMAT};
+use ash::{vk, Device};
+use bytemuck::{Pod, Zeroable};
 
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Debug)]
@@ -25,10 +25,9 @@ pub struct PipelineBuilder {
     pub color_attachment_format: vk::Format,
 }
 impl PipelineBuilder {
-
     pub(crate) fn build(mut self, device: &Device) -> vk::Pipeline {
         let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
-            .viewport_count(1)  // dynamic state allows us to only specify count
+            .viewport_count(1) // dynamic state allows us to only specify count
             .scissor_count(1);
         let color_blend_attachments = [self.color_blend_attachment];
         let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
@@ -37,8 +36,7 @@ impl PipelineBuilder {
         // we don't need this as we're using dynamic state
         let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::builder();
         let dynamic_state = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dynamic_state_info = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_state);
+        let dynamic_state_info = vk::PipelineDynamicStateCreateInfo::builder().dynamic_states(&dynamic_state);
         let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
             .stages(&self.shader_stages)
             .vertex_input_state(&vertex_input_info)
@@ -52,7 +50,11 @@ impl PipelineBuilder {
             .push_next(&mut self.render_info)
             .dynamic_state(&dynamic_state_info);
 
-        unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[*pipeline_info], None).unwrap()[0] }
+        unsafe {
+            device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[*pipeline_info], None)
+                .unwrap()[0]
+        }
     }
 }
 

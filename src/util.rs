@@ -1,8 +1,7 @@
-use std::error::Error;
-use ash::{Device, vk};
-use glam::{Mat4, Vec4};
 use crate::resources::{AllocatedBuffer, Allocator, DescriptorAllocator};
-
+use ash::{vk, Device};
+use glam::{Mat4, Vec4};
+use std::error::Error;
 
 pub struct FrameData {
     pub command_pool: vk::CommandPool,
@@ -47,31 +46,31 @@ pub struct DescriptorLayoutBuilder {
 
 impl DescriptorLayoutBuilder {
     pub fn add_binding(mut self, binding: u32, descriptor_type: vk::DescriptorType, stage_flags: vk::ShaderStageFlags) -> Self {
-        self.bindings.push(vk::DescriptorSetLayoutBinding::builder()
-            .binding(binding)
-            .descriptor_type(descriptor_type)
-            .descriptor_count(1)
-            .stage_flags(stage_flags)
-            .build());
+        self.bindings.push(
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(binding)
+                .descriptor_type(descriptor_type)
+                .descriptor_count(1)
+                .stage_flags(stage_flags)
+                .build(),
+        );
         self
     }
-    
+
     pub fn clear(mut self) {
         self.bindings.clear();
     }
 
     pub fn build(self, device: &Device) -> vk::DescriptorSetLayout {
-        
-        let info = vk::DescriptorSetLayoutCreateInfo::builder()
-            .bindings(&self.bindings);
+        let info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(&self.bindings);
         unsafe { device.create_descriptor_set_layout(&info, None) }.unwrap()
     }
 }
 pub mod device_discovery {
-    use std::ffi::CStr;
     use ash::extensions::khr::Surface;
-    use ash::{Instance, vk};
+    use ash::{vk, Instance};
     use log::info;
+    use std::ffi::CStr;
 
     pub(crate) fn pick_physical_device(instance: &Instance, surface: &Surface, surface_khr: vk::SurfaceKHR) -> vk::PhysicalDevice {
         let devices = unsafe { instance.enumerate_physical_devices().unwrap() };
@@ -156,28 +155,47 @@ pub(crate) fn transition_image(
     unsafe { device.cmd_pipeline_barrier2(cmd, &dependency_info) }
 }
 
-pub(crate) fn copy_image_to_image(device: &Device, cmd: vk::CommandBuffer, source: vk::Image, destination: vk::Image, src_extent: vk::Extent2D, dst_extent: vk::Extent2D) {
+pub(crate) fn copy_image_to_image(
+    device: &Device,
+    cmd: vk::CommandBuffer,
+    source: vk::Image,
+    destination: vk::Image,
+    src_extent: vk::Extent2D,
+    dst_extent: vk::Extent2D,
+) {
     let blit_region = vk::ImageBlit2::builder()
         .src_offsets([
             vk::Offset3D { x: 0, y: 0, z: 0 },
-            vk::Offset3D { x: src_extent.width as i32, y: src_extent.height as i32, z: 1 },
+            vk::Offset3D {
+                x: src_extent.width as i32,
+                y: src_extent.height as i32,
+                z: 1,
+            },
         ])
         .dst_offsets([
             vk::Offset3D { x: 0, y: 0, z: 0 },
-            vk::Offset3D { x: dst_extent.width as i32, y: dst_extent.height as i32, z: 1 },
+            vk::Offset3D {
+                x: dst_extent.width as i32,
+                y: dst_extent.height as i32,
+                z: 1,
+            },
         ])
-        .src_subresource(vk::ImageSubresourceLayers::builder()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .mip_level(0)
-            .base_array_layer(0)
-            .layer_count(1)
-            .build())
-        .dst_subresource(vk::ImageSubresourceLayers::builder()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .mip_level(0)
-            .base_array_layer(0)
-            .layer_count(1)
-            .build());
+        .src_subresource(
+            vk::ImageSubresourceLayers::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1)
+                .build(),
+        )
+        .dst_subresource(
+            vk::ImageSubresourceLayers::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1)
+                .build(),
+        );
 
     let regions = [*blit_region];
     let blit_info = vk::BlitImageInfo2::builder()
@@ -193,13 +211,16 @@ pub(crate) fn copy_image_to_image(device: &Device, cmd: vk::CommandBuffer, sourc
 
 pub fn load_shader_module(device: &Device, code: &[u8]) -> Result<vk::ShaderModule, Box<dyn Error>> {
     // copy vec<u8> into vec<u32> where each u32 is a 4 byte chunk of u8s
-    let code: Vec<u32> = code.chunks(4).map(|chunk| {
-        let mut bytes = [0u8; 4];
-        for (i, byte) in chunk.iter().enumerate() {
-            bytes[i] = *byte;
-        }
-        u32::from_ne_bytes(bytes)
-    }).collect();
+    let code: Vec<u32> = code
+        .chunks(4)
+        .map(|chunk| {
+            let mut bytes = [0u8; 4];
+            for (i, byte) in chunk.iter().enumerate() {
+                bytes[i] = *byte;
+            }
+            u32::from_ne_bytes(bytes)
+        })
+        .collect();
     let info = vk::ShaderModuleCreateInfo::builder().code(&code);
     unsafe { Ok(device.create_shader_module(&info, None)?) }
 }
