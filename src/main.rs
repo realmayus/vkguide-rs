@@ -8,8 +8,8 @@ mod gltf;
 use ash::extensions::khr::{Surface, Swapchain};
 
 use crate::pipeline::{PipelineBuilder, Vertex};
-use crate::resources::{AllocUsage, AllocatedBuffer, AllocatedImage, Allocator, DescriptorAllocator, PoolSizeRatio};
-use crate::util::{device_discovery, load_shader_module, DeletionQueue, DescriptorLayoutBuilder};
+use crate::resources::{AllocUsage, AllocatedBuffer, AllocatedImage, Allocator, DescriptorAllocator, PoolSizeRatio, DescriptorWriter};
+use crate::util::{device_discovery, DeletionQueue, DescriptorLayoutBuilder, GpuSceneData};
 use ash::{vk, Device, Instance};
 use gpu_alloc::GpuAllocator;
 use gpu_alloc_ash::{device_properties, AshMemoryDevice};
@@ -58,6 +58,8 @@ struct App {
     immediate_command_buffer: vk::CommandBuffer,
     depth_image: Option<AllocatedImage>,
     meshes: Vec<Mesh>,
+    scene_data: GpuSceneData,
+    scene_data_layout: vk::DescriptorSetLayout,
 }
 
 #[derive(Default)]
@@ -121,7 +123,7 @@ impl App {
         let ((swapchain, swapchain_khr), swapchain_images, swapchain_views, draw_image, depth_image) =
             Self::create_swapchain(&instance, &device, surface_khr, capabilities, &mut allocator, window_size);
         let (immediate_command_pool, immediate_command_buffer, immediate_fence, frames) = Self::init_commands(graphics_queue.1, &device, &mut deletion_queue);
-        let (descriptor_allocator, draw_image_descriptor_set_layout, draw_image_descriptor_set) =
+        let (descriptor_allocator, draw_image_descriptor_set_layout, draw_image_descriptor_set, scene_data_layout) =
             Self::init_descriptors(&device, draw_image.view, &mut deletion_queue);
         let mesh_pipeline = MeshPipeline::new(&device, window_size, &mut deletion_queue);
 
@@ -153,6 +155,19 @@ impl App {
             immediate_command_buffer, 
             immediate_fence,
             meshes: vec![],
+            scene_data_layout,
+            scene_data: GpuSceneData {
+                view: glam::Mat4::look_at_rh(
+                    Vec3::new(0.0, 0.0, 3.0),
+                    Vec3::new(0.0, 0.0, 0.0),
+                    Vec3::new(0.0, 1.0, 0.0),
+                ),
+                proj: glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, window_size.0 as f32 / window_size.1 as f32, 0.1, 100.0), // Todo update proj
+                viewproj: Default::default(),
+                ambient_color: Default::default(),
+                sun_dir: Default::default(),
+                sun_color: Default::default(),
+            }
         })
     }
 
@@ -359,38 +374,52 @@ impl App {
                     render_semaphore,
                     render_fence,
                     deletion_queue: DeletionQueue::default(),
+                    descriptor_allocator: DescriptorAllocator::new(device, 1000, &[
+                        PoolSizeRatio {
+                            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                            ratio: 3.0,
+                        },
+                        PoolSizeRatio {
+                            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                            ratio: 3.0,
+                        },
+                        PoolSizeRatio {
+                            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                            ratio: 3.0,
+                        },
+                        PoolSizeRatio {
+                            descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                            ratio: 4.0,
+                        },
+                    ]),
+                    stale_buffers: Vec::new(),
                 }
             }),
         )
     }
 
-    fn init_descriptors(device: &Device, draw_image: vk::ImageView, deletion_queue: &mut DeletionQueue) -> (DescriptorAllocator, vk::DescriptorSetLayout, vk::DescriptorSet) {
+    fn init_descriptors(device: &Device, draw_image: vk::ImageView, deletion_queue: &mut DeletionQueue) -> (DescriptorAllocator, vk::DescriptorSetLayout, vk::DescriptorSet, vk::DescriptorSetLayout) {
         let sizes = [PoolSizeRatio {
             descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
             ratio: 1.0,
         }];
-        let descriptor_pool = DescriptorAllocator::new(device, 1, &sizes);
+        let mut descriptor_pool = DescriptorAllocator::new(device, 1, &sizes);
         let builder = DescriptorLayoutBuilder::default().add_binding(0, vk::DescriptorType::STORAGE_IMAGE, vk::ShaderStageFlags::COMPUTE);
         let layout = builder.build(device);
         let descriptor_set = descriptor_pool.allocate(device, layout);
-        let img_info = vk::DescriptorImageInfo::builder()
-            .image_layout(vk::ImageLayout::GENERAL)
-            .image_view(draw_image)
-            .build();
-        let img_infos = [img_info];
-        let write = vk::WriteDescriptorSet::builder()
-            .dst_set(descriptor_set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-            .image_info(&img_infos);
-        unsafe { device.update_descriptor_sets(&[write.build()], &[]) }
+        let mut writer = DescriptorWriter::default();
+        writer.write_image(0, draw_image, vk::Sampler::null(), vk::ImageLayout::GENERAL, vk::DescriptorType::STORAGE_IMAGE);
+        writer.update_set(device, descriptor_set);
+        let scene_info_builder = DescriptorLayoutBuilder::default().add_binding(0, vk::DescriptorType::UNIFORM_BUFFER, vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT);
+        let scene_info_layout = scene_info_builder.build(device);
         deletion_queue.push(move |device| {
             unsafe {
                 device.destroy_descriptor_set_layout(layout, None);
-                device.destroy_descriptor_pool(descriptor_pool.pool, None);
+                device.destroy_descriptor_set_layout(scene_info_layout, None);
+                // device.destroy_descriptor_pool(pool, None);
             }
         });
-        (descriptor_pool, layout, descriptor_set)
+        (descriptor_pool, layout, descriptor_set, scene_info_layout)
     }
     unsafe fn destroy_swapchain(&mut self) {
         self.swapchain.0.destroy_swapchain(self.swapchain.1, None);
@@ -527,10 +556,6 @@ impl App {
         &self.frames[(self.current_frame % FRAME_OVERLAP as u32) as usize]
     }
 
-    fn current_frame_mut(&mut self) -> &mut FrameData {
-        &mut self.frames[(self.current_frame % FRAME_OVERLAP as u32) as usize]
-    }
-
     fn draw(&mut self) {
         unsafe {
             // wait until GPU has finished rendering the last frame, with a timeout of 1
@@ -538,7 +563,11 @@ impl App {
                 .wait_for_fences(&[self.current_frame().render_fence], true, 1000000000)
                 .unwrap();
             let device = self.device.clone();
-            self.current_frame_mut().deletion_queue.flush(&device);
+            frame!(self).deletion_queue.flush(&device);
+            frame!(self).descriptor_allocator.clear_pools(&device);
+            for buffer in frame!(self).stale_buffers.drain(..) {
+                buffer.destroy(&device, &mut self.allocator);
+            }
             self.device.reset_fences(&[self.current_frame().render_fence]).unwrap();
 
             // acquire the next image
@@ -587,6 +616,28 @@ impl App {
                 vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
             );
             
+            let mut scene_data_buffer = AllocatedBuffer::new(
+                &self.device,
+                &mut self.allocator,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                AllocUsage::Shared,
+                std::mem::size_of::<GpuSceneData>() as vk::DeviceSize,
+                Some("Scene Data Buffer".into()),
+            );
+
+            let map = scene_data_buffer
+                    .allocation
+                    .map(AshMemoryDevice::wrap(&self.device), 0, std::mem::size_of::<GpuSceneData>())
+                    .unwrap();
+            // copy scene data to buffer
+            let scene_data_ptr = map.as_ptr() as *mut GpuSceneData;
+            scene_data_ptr.copy_from_nonoverlapping(&self.scene_data, 1);
+            let global_descriptor = frame!(self).descriptor_allocator.allocate(&self.device, self.scene_data_layout);
+            let mut writer = DescriptorWriter::default();
+            writer.write_buffer(0, scene_data_buffer.buffer, std::mem::size_of::<GpuSceneData>() as vk::DeviceSize, 0, vk::DescriptorType::UNIFORM_BUFFER);
+            writer.update_set(&self.device, global_descriptor);
+            frame!(self).stale_buffers.push(scene_data_buffer);
+
             self.mesh_pipeline.draw(&self.device, cmd_buffer, &self.meshes, self.draw_image.as_ref().unwrap().view, self.depth_image.as_ref().unwrap().view);
 
             // prepare copying of the draw image to the swapchain image
@@ -687,20 +738,28 @@ impl Drop for App {
         unsafe {
             self.device.device_wait_idle().unwrap();
             self.main_deletion_queue.flush(&self.device);
+            self.descriptor_allocator.destroy_pools(&self.device);
             for mesh in self.meshes.drain(..) {
                 let mem = mesh.mem.unwrap();
                 mem.index_buffer.destroy(&self.device, &mut self.allocator);
                 mem.vertex_buffer.destroy(&self.device, &mut self.allocator);
             }
-            
+
+
             self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator);
             self.depth_image.take().unwrap().destroy(&self.device, &mut self.allocator);
 
-            for frame in self.frames.iter() {
+            for frame in self.frames.iter_mut() {
+                frame.deletion_queue.flush(&self.device);  // take care of frames that were prepared but not reached in the render loop yet
+                for buffer in frame.stale_buffers.drain(..) {
+                    buffer.destroy(&self.device, &mut self.allocator);
+                }
+
                 self.device.destroy_command_pool(frame.command_pool, None);
                 self.device.destroy_fence(frame.render_fence, None);
                 self.device.destroy_semaphore(frame.swapchain_semaphore, None);
                 self.device.destroy_semaphore(frame.render_semaphore, None);
+                frame.descriptor_allocator.destroy_pools(&self.device);
             }
             self.destroy_swapchain();
             self.device.destroy_device(None);

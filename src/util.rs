@@ -1,15 +1,27 @@
 use std::error::Error;
 use ash::{Device, vk};
-use crate::resources::{AllocatedBuffer, Allocator};
+use glam::{Mat4, Vec4};
+use crate::resources::{AllocatedBuffer, Allocator, DescriptorAllocator};
 
 
 pub struct FrameData {
-    pub(crate) command_pool: vk::CommandPool,
-    pub(crate) command_buffer: vk::CommandBuffer,
-    pub(crate) swapchain_semaphore: vk::Semaphore,
-    pub(crate) render_semaphore: vk::Semaphore,
-    pub(crate) render_fence: vk::Fence,
-    pub(crate) deletion_queue: DeletionQueue,
+    pub command_pool: vk::CommandPool,
+    pub command_buffer: vk::CommandBuffer,
+    pub swapchain_semaphore: vk::Semaphore,
+    pub render_semaphore: vk::Semaphore,
+    pub render_fence: vk::Fence,
+    pub deletion_queue: DeletionQueue,
+    pub descriptor_allocator: DescriptorAllocator,
+    pub stale_buffers: Vec<AllocatedBuffer>,
+}
+
+pub struct GpuSceneData {
+    pub view: Mat4,
+    pub proj: Mat4,
+    pub viewproj: Mat4,
+    pub ambient_color: Vec4,
+    pub sun_dir: Vec4,
+    pub sun_color: Vec4,
 }
 
 #[derive(Default)]
@@ -190,4 +202,11 @@ pub fn load_shader_module(device: &Device, code: &[u8]) -> Result<vk::ShaderModu
     }).collect();
     let info = vk::ShaderModuleCreateInfo::builder().code(&code);
     unsafe { Ok(device.create_shader_module(&info, None)?) }
+}
+
+#[macro_export]
+macro_rules! frame {
+    ($m: ident) => {
+        &mut $m.frames[($m.current_frame % FRAME_OVERLAP as u32) as usize]
+    };
 }
