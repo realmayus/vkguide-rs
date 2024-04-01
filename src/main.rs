@@ -711,7 +711,15 @@ impl App {
             let white = [255u8, 255, 255, 255];
             let black = [0u8, 0, 0, 255];
             let magenta = [255u8, 0, 255, 255];
-            let pixels: [[u8; 4]; 16 * 16] = core::array::from_fn(|i| if i % 2 == 0 { magenta } else { white });
+            let pixels: [[u8; 4]; 16 * 16] = core::array::from_fn(|i| 
+                // create a checkerboard pattern of white and magenta
+                if (i / 16 + i % 16) % 2 == 0 {
+                    white
+                } else {
+                    magenta
+                }
+                
+            );
             let pixel_data = pixels.iter().flat_map(|p| p.iter().copied()).collect::<Vec<_>>();
 
             let cleanup_white = this.texture_manager.textures[0]

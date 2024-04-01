@@ -495,10 +495,16 @@ impl TextureManager {
             Some("Checkerboard Image".into()),
         );
         let sampler_info = vk::SamplerCreateInfo::builder()
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
             .mag_filter(vk::Filter::NEAREST)
             .min_filter(vk::Filter::NEAREST);
         let sampler_nearest = unsafe { device.create_sampler(&sampler_info, None).unwrap() };
         let sampler_info = vk::SamplerCreateInfo::builder()
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR);
         let sampler_linear = unsafe { device.create_sampler(&sampler_info, None).unwrap() };
