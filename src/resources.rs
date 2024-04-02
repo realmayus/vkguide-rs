@@ -1,16 +1,19 @@
-use crate::pipeline::Vertex;
+use std::sync::{Arc, Mutex};
 use crate::util::{DeletionQueue, transition_image};
-use crate::{App, ImmediateSubmitFn};
-use ash::prelude::VkResult;
+use crate::{ImmediateSubmitFn};
 use ash::vk::{DeviceMemory, DeviceSize};
 use ash::{vk, Device};
 use gpu_alloc_ash::AshMemoryDevice;
 use log::debug;
 
-pub type Allocation = gpu_alloc::MemoryBlock<DeviceMemory>;
-pub type Allocator = gpu_alloc::GpuAllocator<DeviceMemory>;
+pub struct Allocation(pub gpu_alloc::MemoryBlock<DeviceMemory>);
+pub struct Allocator {
+    pub allocator: gpu_alloc::GpuAllocator<DeviceMemory>,
+    pub device: Device,
+}
 
 const LOG_ALLOCATIONS: bool = false;
+
 
 #[derive(Clone)]
 pub struct PoolSizeRatio {
@@ -174,7 +177,7 @@ pub struct AllocatedBuffer {
 impl AllocatedBuffer {
     pub fn new(
         device: &Device,
-        allocator: &mut Allocator,
+        allocator: Arc<Mutex<Allocator>>,
         buffer_usages: vk::BufferUsageFlags,
         alloc_usages: AllocUsage,
         size: DeviceSize,
@@ -184,7 +187,7 @@ impl AllocatedBuffer {
         let buffer = unsafe { device.create_buffer(&info, None) }.unwrap();
         let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
         let allocation = unsafe {
-            allocator
+            allocator.lock().unwrap().allocator
                 .alloc(
                     AshMemoryDevice::wrap(&device),
                     gpu_alloc::Request {
@@ -214,13 +217,13 @@ impl AllocatedBuffer {
 
         Self {
             buffer,
-            allocation,
+            allocation: Allocation(allocation),
             size,
             label,
         }
     }
 
-    pub(crate) fn destroy(self, device: &Device, allocator: &mut Allocator) {
+    pub(crate) fn destroy(self, device: &Device, allocator: Arc<Mutex<Allocator>>) {
         if LOG_ALLOCATIONS {
             debug!(
                 "Destroying buffer '{}' ({:?}) of size {}",
@@ -230,7 +233,7 @@ impl AllocatedBuffer {
             );
         }
         unsafe { device.destroy_buffer(self.buffer, None) };
-        unsafe { allocator.dealloc(AshMemoryDevice::wrap(device), self.allocation) };
+        unsafe { allocator.lock().unwrap().allocator.dealloc(AshMemoryDevice::wrap(device), self.allocation.0) };
     }
 }
 
@@ -267,7 +270,7 @@ pub struct AllocatedImage {
 impl AllocatedImage {
     pub fn new(
         device: &Device,
-        allocator: &mut Allocator,
+        allocator: Arc<Mutex<Allocator>>,
         extent: vk::Extent3D,
         format: vk::Format,
         image_usages: vk::ImageUsageFlags,
@@ -288,7 +291,7 @@ impl AllocatedImage {
         let image = unsafe { device.create_image(&info, None) }.unwrap();
         let reqs = unsafe { device.get_image_memory_requirements(image) };
         let allocation = unsafe {
-            allocator
+            allocator.lock().unwrap().allocator
                 .alloc(
                     AshMemoryDevice::wrap(&device),
                     gpu_alloc::Request {
@@ -336,7 +339,7 @@ impl AllocatedImage {
         Self {
             image,
             view,
-            allocation,
+            allocation: Allocation(allocation),
             extent,
             format,
             label,
@@ -344,7 +347,7 @@ impl AllocatedImage {
     }
 
     // https://i.imgflip.com/8l3uzz.jpg
-    pub fn write<'a>(&'a self, data: &'a [u8], device: &Device, allocator: &mut Allocator, cmd: vk::CommandBuffer) -> Box<dyn (FnOnce(&Device, &mut Allocator))> {
+    pub fn write<'a>(&'a self, data: &'a [u8], device: &Device, allocator: Arc<Mutex<Allocator>>, cmd: vk::CommandBuffer) -> Box<dyn (FnOnce(&Device, Arc<Mutex<Allocator>>))> {
             let mut staging = AllocatedBuffer::new(
                 device,
                 allocator,
@@ -355,7 +358,7 @@ impl AllocatedImage {
             );
             unsafe {
                 let data_ptr = staging
-                    .allocation
+                    .allocation.0
                     .map(AshMemoryDevice::wrap(device), 0, staging.size as usize)
                     .unwrap();
                 std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr.as_ptr(), data.len());
@@ -397,12 +400,12 @@ impl AllocatedImage {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             );
-            Box::from(|device: &Device, allocator: &mut Allocator| {
+            Box::from(|device: &Device, allocator: Arc<Mutex<Allocator>>| {
                 staging.destroy(device, allocator);
             })
     }
 
-    pub(crate) fn destroy(self, device: &Device, allocator: &mut Allocator) {
+    pub(crate) fn destroy(self, device: &Device, allocator: Arc<Mutex<Allocator>>) {
         if LOG_ALLOCATIONS {
             debug!(
                 "Destroying image '{}' ({:?}) of size {:?} and format {:?}",
@@ -414,7 +417,7 @@ impl AllocatedImage {
         }
         unsafe { device.destroy_image_view(self.view, None) };
         unsafe { device.destroy_image(self.image, None) };
-        unsafe { allocator.dealloc(AshMemoryDevice::wrap(device), self.allocation) };
+        unsafe { allocator.lock().unwrap().allocator.dealloc(AshMemoryDevice::wrap(device), self.allocation.0) };
     }
 }
 
@@ -439,22 +442,22 @@ impl TextureManager {
         self.textures.push(Texture { image: texture });
     }
 
-    pub fn destroy(self, device: &Device, allocator: &mut Allocator) {
+    pub fn destroy(self, device: &Device, allocator: Arc<Mutex<Allocator>>) {
         for texture in self.textures {
-            texture.image.destroy(device, allocator);
+            texture.image.destroy(device, allocator.clone());
         }
     }
 
     pub fn init_defaults(
         &mut self,
         device: &Device,
-        allocator: &mut Allocator,
+        allocator: Arc<Mutex<Allocator>>,
         bindless_descriptor_set: vk::DescriptorSet,
         deletion_queue: &mut DeletionQueue,
     ) {
         let white_img = AllocatedImage::new(
             device,
-            allocator,
+            allocator.clone(),
             vk::Extent3D {
                 width: 1,
                 height: 1,
@@ -468,7 +471,7 @@ impl TextureManager {
         );
         let black_img = AllocatedImage::new(
             device,
-            allocator,
+            allocator.clone(),
             vk::Extent3D {
                 width: 1,
                 height: 1,

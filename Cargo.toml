@@ -17,6 +17,11 @@ env_logger = "0.11.3"
 bytemuck = { version = "1.15.0" , features = ["derive"]}
 glam = "0.27.0"
 gltf = { version = "1.4.0" }
+egui-winit = "0.23.0"
+egui-winit-ash-integration = "0.6.0"
+egui = "0.23.0"
+anyhow = "1.0.81"
+
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 raw-window-metal = "0.3"

@@ -4,6 +4,7 @@ mod gltf;
 mod pipeline;
 mod resources;
 mod util;
+mod ui;
 
 use ash::extensions::khr::{Surface, Swapchain};
 
@@ -11,7 +12,7 @@ use crate::pipeline::mesh::MeshPipeline;
 use crate::pipeline::{PipelineBuilder, Vertex};
 use crate::resources::{AllocUsage, AllocatedBuffer, AllocatedImage, Allocator, DescriptorAllocator, PoolSizeRatio, TextureManager, DescriptorImageWriteInfo, update_set, DescriptorBufferWriteInfo};
 use crate::util::{device_discovery, DeletionQueue, DescriptorLayoutBuilder, GpuSceneData};
-use ash::vk::{DescriptorSet, DescriptorSetLayout, Sampler};
+use ash::vk::{DescriptorSet, DescriptorSetLayout, Sampler, SurfaceFormatKHR};
 use ash::{vk, Device, Instance};
 use glam::{Vec2, Vec3};
 use gpu_alloc::GpuAllocator;
@@ -20,7 +21,9 @@ use log::{debug, info};
 use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 use std::error::Error;
 use std::ffi::CStr;
+use std::mem::ManuallyDrop;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use util::FrameData;
 use winit::{
     dpi::PhysicalSize,
@@ -28,6 +31,8 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
+use crate::ui::ArcAllocator;
+use egui;
 
 const FRAME_OVERLAP: usize = 2;
 
@@ -47,7 +52,7 @@ struct App {
     current_frame: u32,
     window: winit::window::Window,
     window_size: (u32, u32),
-    allocator: Allocator,
+    allocator: Arc<Mutex<Allocator>>,
     main_deletion_queue: DeletionQueue,
     draw_image: Option<AllocatedImage>,
     descriptor_allocator: DescriptorAllocator,
@@ -65,6 +70,7 @@ struct App {
     samplers: Vec<vk::Sampler>,
     bindless_descriptor_set: vk::DescriptorSet,
     texture_manager: TextureManager,
+    egui_integration: ManuallyDrop<egui_winit_ash_integration::Integration<ArcAllocator>>,
 }
 
 #[derive(Default)]
@@ -90,7 +96,7 @@ pub const SWAPCHAIN_IMAGE_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 pub const API_VERSION: u32 = vk::make_api_version(0, 1, 3, 0);
 
-type ImmediateSubmitFn<'a> = Box<dyn (Fn(&mut App, vk::CommandBuffer) -> Box<dyn (FnOnce(&Device, &mut Allocator))>) + 'a>;
+type ImmediateSubmitFn<'a> = Box<dyn (Fn(&mut App, vk::CommandBuffer) -> Box<dyn (FnOnce(&Device, Arc<Mutex<Allocator>>))>) + 'a>;
 
 impl App {
     fn new(event_loop: &EventLoop<()>) -> Result<Self, Box<dyn Error>> {
@@ -122,11 +128,14 @@ impl App {
 
         let config = gpu_alloc::Config::i_am_prototyping();
         let device_properties = unsafe { device_properties(&instance, API_VERSION, physical_device)? };
-        let mut allocator = GpuAllocator::new(config, device_properties);
+        let mut allocator = Arc::new(Mutex::new(Allocator {
+            allocator: GpuAllocator::new(config, device_properties),
+            device: device.clone(),
+        }));
 
         let capabilities = unsafe { surface.get_physical_device_surface_capabilities(physical_device, surface_khr) }?;
         let ((swapchain, swapchain_khr), swapchain_images, swapchain_views, draw_image, depth_image) =
-            Self::create_swapchain(&instance, &device, surface_khr, capabilities, &mut allocator, window_size);
+            Self::create_swapchain(&instance, &device, surface_khr, capabilities, allocator.clone(), window_size);
         let (immediate_command_pool, immediate_command_buffer, immediate_fence, frames) =
             Self::init_commands(graphics_queue.1, &device, &mut deletion_queue);
         let (descriptor_allocator, draw_image_descriptor_set_layout, draw_image_descriptor_set, scene_data_layout) =
@@ -134,6 +143,23 @@ impl App {
         let (bindless_descriptor_set, bindless_set_layout) = Self::init_bindless(&device);
         let mesh_pipeline = MeshPipeline::new(&device, window_size, &mut deletion_queue, bindless_set_layout);
 
+        let egui_integration = ManuallyDrop::new(
+            egui_winit_ash_integration::Integration::new(
+                event_loop,
+                window_size.0,
+                window_size.1,
+                1.0,
+                egui::FontDefinitions::default(),
+                egui::style::Style::default(),
+                device.clone(),
+                ArcAllocator(allocator.clone()),
+                graphics_queue.1,
+                graphics_queue.0,
+                swapchain.clone(),
+                swapchain_khr,
+                SurfaceFormatKHR::builder().format(SWAPCHAIN_IMAGE_FORMAT).color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR).build()
+            )
+        );
         Ok(App {
             entry,
             instance,
@@ -175,6 +201,7 @@ impl App {
             samplers: vec![],
             bindless_descriptor_set,
             texture_manager: TextureManager::new(),
+            egui_integration: egui_integration,
         })
     }
 
@@ -258,7 +285,7 @@ impl App {
         device: &Device,
         surface_khr: vk::SurfaceKHR,
         capabilities: vk::SurfaceCapabilitiesKHR,
-        allocator: &mut Allocator,
+        allocator: Arc<Mutex<Allocator>>,
         window_size: (u32, u32),
     ) -> (
         (Swapchain, vk::SwapchainKHR),
@@ -314,7 +341,7 @@ impl App {
 
         let draw_image = AllocatedImage::new(
             &device,
-            allocator,
+            allocator.clone(),
             vk::Extent3D {
                 width: window_size.0,
                 height: window_size.1,
@@ -332,7 +359,7 @@ impl App {
 
         let depth_image = AllocatedImage::new(
             &device,
-            allocator,
+            allocator.clone(),
             vk::Extent3D {
                 width: window_size.0,
                 height: window_size.1,
@@ -555,13 +582,14 @@ impl App {
         debug!("Resizing to {:?}", size);
         self.resize_swapchain(size);
         self.mesh_pipeline.resize(size);
+        self.egui_integration.update_swapchain(size.0, size.1, self.swapchain.1, SurfaceFormatKHR::builder().format(SWAPCHAIN_IMAGE_FORMAT).color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR).build());
     }
     fn resize_swapchain(&mut self, size: (u32, u32)) {
         unsafe {
             self.device.device_wait_idle().unwrap();
             self.destroy_swapchain();
-            self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator);
-            self.depth_image.take().unwrap().destroy(&self.device, &mut self.allocator);
+            self.draw_image.take().unwrap().destroy(&self.device, self.allocator.clone());
+            self.depth_image.take().unwrap().destroy(&self.device, self.allocator.clone());
         }
         self.window_size = size;
         let capabilities = unsafe {
@@ -574,7 +602,7 @@ impl App {
             &self.device,
             self.surface,
             capabilities,
-            &mut self.allocator,
+            self.allocator.clone(),
             self.window_size,
         );
         self.swapchain = swapchain;
@@ -605,7 +633,7 @@ impl App {
         let index_buffer_size = (mesh.indices.len() * std::mem::size_of::<u32>()) as vk::DeviceSize;
         let vertex_buffer = AllocatedBuffer::new(
             &self.device,
-            &mut self.allocator,
+            self.allocator.clone(),
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             AllocUsage::GpuOnly,
             vertex_buffer_size,
@@ -615,7 +643,7 @@ impl App {
         let buffer_device_address = unsafe { self.device.get_buffer_device_address(&device_address_info) };
         let index_buffer = AllocatedBuffer::new(
             &self.device,
-            &mut self.allocator,
+            self.allocator.clone(),
             vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             AllocUsage::GpuOnly,
             index_buffer_size,
@@ -624,7 +652,7 @@ impl App {
 
         let mut staging = AllocatedBuffer::new(
             &self.device,
-            &mut self.allocator,
+            self.allocator.clone(),
             vk::BufferUsageFlags::TRANSFER_SRC,
             AllocUsage::Shared,
             vertex_buffer_size + index_buffer_size,
@@ -634,6 +662,7 @@ impl App {
         let map = unsafe {
             staging
                 .allocation
+                .0
                 .map(AshMemoryDevice::wrap(&self.device), 0, staging.size as usize)
                 .unwrap()
         };
@@ -663,9 +692,9 @@ impl App {
                 this.device.cmd_copy_buffer(cmd, staging.buffer, index_buffer.buffer, &[index_copy]);
             };
             // return empty FnOnce closure
-            Box::from(move |_: &Device, _: &mut Allocator| {})
+            Box::from(move |_: &Device, _: Arc<Mutex<Allocator>>| {})
         }));
-        staging.destroy(&self.device, &mut self.allocator);
+        staging.destroy(&self.device, self.allocator.clone());
         GpuMesh {
             vertex_buffer,
             vertex_address: buffer_device_address,
@@ -693,7 +722,7 @@ impl App {
                 .queue_submit2(self.graphics_queue.0, &submits, self.immediate_fence)
                 .unwrap();
             self.device.wait_for_fences(&[self.immediate_fence], true, 1000000000).unwrap();
-            cleanup(&self.device, &mut self.allocator);
+            cleanup(&self.device, self.allocator.clone());
         }
     }
     fn current_frame(&self) -> &FrameData {
@@ -703,7 +732,7 @@ impl App {
     fn init_textures(&mut self) {
         self.texture_manager.init_defaults(
             &self.device,
-            &mut self.allocator,
+            self.allocator.clone(),
             self.bindless_descriptor_set,
             &mut self.main_deletion_queue,
         );
@@ -711,32 +740,32 @@ impl App {
             let white = [255u8, 255, 255, 255];
             let black = [0u8, 0, 0, 255];
             let magenta = [255u8, 0, 255, 255];
-            let pixels: [[u8; 4]; 16 * 16] = core::array::from_fn(|i| 
+            let pixels: [[u8; 4]; 16 * 16] = core::array::from_fn(|i|
                 // create a checkerboard pattern of white and magenta
                 if (i / 16 + i % 16) % 2 == 0 {
                     white
                 } else {
                     magenta
                 }
-                
+
             );
             let pixel_data = pixels.iter().flat_map(|p| p.iter().copied()).collect::<Vec<_>>();
 
             let cleanup_white = this.texture_manager.textures[0]
                 .image
-                .write(&white, &this.device, &mut this.allocator, cmd);
+                .write(&white, &this.device, this.allocator.clone(), cmd);
 
             let cleanup_black = this.texture_manager.textures[1]
                 .image
-                .write(&black, &this.device, &mut this.allocator, cmd);
+                .write(&black, &this.device, this.allocator.clone(), cmd);
 
             let cleanup_checkerboard = this.texture_manager.textures[2]
                 .image
-                .write(&pixel_data, &this.device, &mut this.allocator, cmd);
+                .write(&pixel_data, &this.device, this.allocator.clone(), cmd);
 
-            Box::new(move |device: &Device, allocator: &mut Allocator| {
-                cleanup_white(device, allocator);
-                cleanup_black(device, allocator);
+            Box::new(move |device: &Device, allocator: Arc<Mutex<Allocator>>| {
+                cleanup_white(device, allocator.clone());
+                cleanup_black(device, allocator.clone());
                 cleanup_checkerboard(device, allocator);
             })
         }));
@@ -752,7 +781,7 @@ impl App {
             frame!(self).deletion_queue.flush(&device);
             frame!(self).descriptor_allocator.clear_pools(&device);
             for buffer in frame!(self).stale_buffers.drain(..) {
-                buffer.destroy(&device, &mut self.allocator);
+                buffer.destroy(&device, self.allocator.clone());
             }
             self.device.reset_fences(&[self.current_frame().render_fence]).unwrap();
 
@@ -804,7 +833,7 @@ impl App {
 
             let mut scene_data_buffer = AllocatedBuffer::new(
                 &self.device,
-                &mut self.allocator,
+                self.allocator.clone(),
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
                 AllocUsage::Shared,
                 std::mem::size_of::<GpuSceneData>() as vk::DeviceSize,
@@ -813,13 +842,14 @@ impl App {
 
             let map = scene_data_buffer
                 .allocation
+                .0
                 .map(AshMemoryDevice::wrap(&self.device), 0, std::mem::size_of::<GpuSceneData>())
                 .unwrap();
             // copy scene data to buffer
             let scene_data_ptr = map.as_ptr() as *mut GpuSceneData;
             scene_data_ptr.copy_from_nonoverlapping(&self.scene_data, 1);
             let global_descriptor = frame!(self).descriptor_allocator.allocate(&self.device, self.scene_data_layout);
-            
+
             update_set(&self.device, global_descriptor, &[], &[
                 DescriptorBufferWriteInfo {
                     binding: 0,
@@ -830,7 +860,7 @@ impl App {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
                 }
             ]);
-            
+
             frame!(self).stale_buffers.push(scene_data_buffer);
 
             self.mesh_pipeline.draw(
@@ -841,6 +871,7 @@ impl App {
                 self.depth_image.as_ref().unwrap().view,
                 self.bindless_descriptor_set,
             );
+            
 
             // prepare copying of the draw image to the swapchain image
             util::transition_image(
@@ -871,13 +902,22 @@ impl App {
                     width: self.window_size.0,
                     height: self.window_size.1,
                 },
-            );
-            // transition the swapchain image to present mode
+            );   
             util::transition_image(
                 &self.device,
                 cmd_buffer,
                 self.swapchain_images[image_index as usize],
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            );
+            ui::draw(&mut self.egui_integration, &self.window, cmd_buffer, image_index as usize);
+
+            // transition the swapchain image to present mode
+            util::transition_image(
+                &self.device,
+                cmd_buffer,
+                self.swapchain_images[image_index as usize],
+                vk::ImageLayout::PRESENT_SRC_KHR,
                 vk::ImageLayout::PRESENT_SRC_KHR,
             );
 
@@ -943,14 +983,14 @@ impl Drop for App {
             self.descriptor_allocator.destroy_pools(&self.device);
             for mesh in self.meshes.drain(..) {
                 let mem = mesh.mem.unwrap();
-                mem.index_buffer.destroy(&self.device, &mut self.allocator);
-                mem.vertex_buffer.destroy(&self.device, &mut self.allocator);
+                mem.index_buffer.destroy(&self.device, self.allocator.clone());
+                mem.vertex_buffer.destroy(&self.device, self.allocator.clone());
             }
-
-            self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator);
-            self.depth_image.take().unwrap().destroy(&self.device, &mut self.allocator);
+            ManuallyDrop::drop(&mut self.egui_integration);
+            self.draw_image.take().unwrap().destroy(&self.device, self.allocator.clone());
+            self.depth_image.take().unwrap().destroy(&self.device,self.allocator.clone());
             for image in self.images.drain(..) {
-                image.destroy(&self.device, &mut self.allocator);
+                image.destroy(&self.device, self.allocator.clone());
             }
             for sampler in self.samplers.drain(..) {
                 self.device.destroy_sampler(sampler, None);
@@ -958,7 +998,7 @@ impl Drop for App {
             for frame in self.frames.iter_mut() {
                 frame.deletion_queue.flush(&self.device); // take care of frames that were prepared but not reached in the render loop yet
                 for buffer in frame.stale_buffers.drain(..) {
-                    buffer.destroy(&self.device, &mut self.allocator);
+                    buffer.destroy(&self.device, self.allocator.clone());
                 }
 
                 self.device.destroy_command_pool(frame.command_pool, None);
