@@ -27,28 +27,26 @@ impl MeshPipeline {
         let fragment_shader =
             load_shader_module(device, include_bytes!("../shaders/spirv/mesh.frag.spv")).expect("Failed to load fragment shader module");
 
-        let push_constant_range = [*vk::PushConstantRange::builder()
+        let push_constant_range = [vk::PushConstantRange::default()
             .offset(0)
             .size(std::mem::size_of::<PushConstants>() as u32)
             .stage_flags(vk::ShaderStageFlags::VERTEX)];
         let binding = [bindless_set_layout];
-        let layout_create_info = vk::PipelineLayoutCreateInfo::builder()
+        let layout_create_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&binding)
             .push_constant_ranges(&push_constant_range);
         let layout = unsafe { device.create_pipeline_layout(&layout_create_info, None).unwrap() };
         let pipeline_builder = PipelineBuilder {
             layout: Some(layout),
             shader_stages: vec![
-                vk::PipelineShaderStageCreateInfo::builder()
+                vk::PipelineShaderStageCreateInfo::default()
                     .stage(vk::ShaderStageFlags::VERTEX)
                     .module(vertex_shader)
-                    .name(CStr::from_bytes_with_nul(b"main\0").unwrap())
-                    .build(),
-                vk::PipelineShaderStageCreateInfo::builder()
+                    .name(CStr::from_bytes_with_nul(b"main\0").unwrap()),
+                vk::PipelineShaderStageCreateInfo::default()
                     .stage(vk::ShaderStageFlags::FRAGMENT)
                     .module(fragment_shader)
-                    .name(CStr::from_bytes_with_nul(b"main\0").unwrap())
-                    .build(),
+                    .name(CStr::from_bytes_with_nul(b"main\0").unwrap()),
             ],
             ..Default::default()
         };
@@ -65,11 +63,11 @@ impl MeshPipeline {
             device.destroy_pipeline(pipeline, None);
         });
 
-        let viewport = *vk::Viewport::builder()
+        let viewport = vk::Viewport::default()
             .width(window_size.0 as f32)
             .height(window_size.1 as f32)
             .max_depth(1.0);
-        let scissor = *vk::Rect2D::builder().extent(vk::Extent2D {
+        let scissor = vk::Rect2D::default().extent(vk::Extent2D {
             width: window_size.0,
             height: window_size.1,
         });
@@ -85,43 +83,40 @@ impl MeshPipeline {
 
     pub fn resize(&mut self, window_size: (u32, u32)) {
         self.window_size = window_size;
-        self.viewport = *vk::Viewport::builder()
+        self.viewport = vk::Viewport::default()
             .width(window_size.0 as f32)
             .height(window_size.1 as f32)
             .max_depth(1.0);
-        self.scissor = *vk::Rect2D::builder().extent(vk::Extent2D {
+        self.scissor = vk::Rect2D::default().extent(vk::Extent2D {
             width: window_size.0,
             height: window_size.1,
         });
     }
     pub fn draw(&self, device: &Device, cmd: vk::CommandBuffer, meshes: &[Mesh], target_view: vk::ImageView, depth_view: vk::ImageView, bindless_descriptor_set: vk::DescriptorSet) {
-        let render_info = {
-            let color_attachment = vk::RenderingAttachmentInfo::builder()
-                .image_view(target_view)
-                .image_layout(vk::ImageLayout::GENERAL);
-            let color_attachments = [color_attachment.build()];
-            let depth_attachment = *vk::RenderingAttachmentInfo::builder()
-                .image_view(depth_view)
-                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 },
-                });
-
-            *vk::RenderingInfo::builder()
-                .color_attachments(&color_attachments)
-                .depth_attachment(&depth_attachment)
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: vk::Extent2D {
-                        width: self.window_size.0,
-                        height: self.window_size.1,
-                    },
-                })
-                .layer_count(1)
-                .view_mask(0)
-        };
+        let color_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(target_view)
+            .image_layout(vk::ImageLayout::GENERAL);
+        let color_attachments = [color_attachment];
+        let depth_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(depth_view)
+            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 },
+            });
+        let render_info = vk::RenderingInfo::default()
+            .color_attachments(&color_attachments)
+            .depth_attachment(&depth_attachment)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: self.window_size.0,
+                    height: self.window_size.1,
+                },
+            })
+            .layer_count(1)
+            .view_mask(0);
         let world = {
             let view = Mat4::look_at_rh(Vec3::new(2.0, 3.0, 5.0), Vec3::ZERO, Vec3::new(0.0, 1.0, 0.0));
             let mut proj = Mat4::perspective_rh(

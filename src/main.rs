@@ -4,30 +4,32 @@ mod gltf;
 mod pipeline;
 mod resources;
 mod util;
+mod ui;
 
-use ash::extensions::khr::{Surface, Swapchain};
-
-use crate::pipeline::mesh::MeshPipeline;
-use crate::pipeline::{PipelineBuilder, Vertex};
+use std::cell::RefCell;
 use crate::resources::{AllocUsage, AllocatedBuffer, AllocatedImage, Allocator, DescriptorAllocator, PoolSizeRatio, TextureManager, DescriptorImageWriteInfo, update_set, DescriptorBufferWriteInfo};
 use crate::util::{device_discovery, DeletionQueue, DescriptorLayoutBuilder, GpuSceneData};
-use ash::vk::{DescriptorSet, DescriptorSetLayout, Sampler};
-use ash::{vk, Device, Instance};
+use ash::vk::{DescriptorSet, DescriptorSetLayout, DeviceMemory, Sampler};
+use ash::{vk, Device, Instance, khr};
 use glam::{Vec2, Vec3};
 use gpu_alloc::GpuAllocator;
 use gpu_alloc_ash::{device_properties, AshMemoryDevice};
 use log::{debug, info};
-use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
+use raw_window_handle::{HasDisplayHandle, HasRawDisplayHandle, HasRawWindowHandle, HasWindowHandle};
 use std::error::Error;
-use std::ffi::CStr;
 use std::path::Path;
+use std::rc::Rc;
+use ash::khr::{swapchain};
 use util::FrameData;
 use winit::{
     dpi::PhysicalSize,
-    event::{Event, VirtualKeyCode, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
+    event::{Event, WindowEvent},
+    event_loop::{EventLoop},
     window::WindowBuilder,
 };
+
+use crate::pipeline::mesh::MeshPipeline;
+use crate::pipeline::Vertex;
 
 const FRAME_OVERLAP: usize = 2;
 
@@ -35,19 +37,19 @@ struct App {
     entry: ash::Entry,
     instance: Instance,
     surface: vk::SurfaceKHR,
-    surface_fn: Surface,
+    surface_fn: ash::khr::surface::Instance,
     physical_device: vk::PhysicalDevice,
-    device: Device,
+    device: Rc<Device>,
     graphics_queue: (vk::Queue, u32),
     present_queue: (vk::Queue, u32),
-    swapchain: (Swapchain, vk::SwapchainKHR),
+    swapchain: (swapchain::Device, vk::SwapchainKHR),
     swapchain_images: Vec<vk::Image>,
     swapchain_views: Vec<vk::ImageView>,
     frames: [FrameData; FRAME_OVERLAP],
     current_frame: u32,
     window: winit::window::Window,
     window_size: (u32, u32),
-    allocator: Allocator,
+    allocator: Rc<RefCell<Allocator>>,
     main_deletion_queue: DeletionQueue,
     draw_image: Option<AllocatedImage>,
     descriptor_allocator: DescriptorAllocator,
@@ -72,6 +74,7 @@ pub struct Model {
     pub meshes: Vec<Mesh>,
     pub children: Vec<Model>,
 }
+
 pub struct GpuMesh {
     index_buffer: AllocatedBuffer,
     vertex_buffer: AllocatedBuffer,
@@ -86,20 +89,162 @@ pub struct Mesh {
     pub(crate) uvs: Vec<Vec2>,
 }
 
+struct SubmitContext {
+    device: Rc<Device>,
+    allocator: Rc<RefCell<Allocator>>,
+    fence: vk::Fence,
+    cmd_buffer: vk::CommandBuffer,
+    queue: vk::Queue,
+    cleanup: Option<Box<dyn FnOnce(&Device, &mut Allocator)>>,
+}
+
+type ImmediateSubmitFn<'a> = Box<(dyn FnOnce(&mut SubmitContext) + 'a)>;
+
+impl SubmitContext {
+    fn new(app: &App) -> Self {
+        Self {
+            device: app.device.clone(),
+            allocator: app.allocator.clone(),
+            fence: app.immediate_fence,
+            cmd_buffer: app.immediate_command_buffer,
+            queue: app.graphics_queue.0,
+            cleanup: None,
+        }
+    }
+
+    fn immediate_submit(&mut self, mut cmd: ImmediateSubmitFn) {
+        let cmd_buffer = self.cmd_buffer;
+        unsafe {
+            self.device.reset_fences(&[self.fence]).unwrap();
+            self.device
+                .reset_command_buffer(cmd_buffer, vk::CommandBufferResetFlags::empty())
+                .unwrap();
+            let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device.begin_command_buffer(cmd_buffer, &begin_info).unwrap();
+            cmd(self);
+            self.device.end_command_buffer(cmd_buffer).unwrap();
+            let cmd_buffer_submit = vk::CommandBufferSubmitInfo::default().command_buffer(cmd_buffer);
+            let cmd_buffer_submits = [cmd_buffer_submit];
+            let submit_info = vk::SubmitInfo2::default().command_buffer_infos(&cmd_buffer_submits);
+            let submits = [submit_info];
+            self.device
+                .queue_submit2(self.queue, &submits, self.fence)
+                .unwrap();
+            self.device.wait_for_fences(&[self.fence], true, 1000000000).unwrap();
+            if self.cleanup.is_some() {
+                self.cleanup.take().unwrap()(&self.device, &mut self.allocator.borrow_mut());
+            }
+        }
+    }
+}
+
+impl Mesh {
+    fn upload(&mut self, ctx: &mut SubmitContext) {
+        info!("Uploading mesh to GPU");
+        debug!("Mesh vertices: {:?}", self.vertices);
+
+        let vertices = self
+            .vertices
+            .iter()
+            .zip(self.normals.iter())
+            .zip(self.uvs.iter())
+            .map(|((vertex, normal), uv)| Vertex {
+                position: vertex.to_array(),
+                normal: normal.to_array(),
+                uv_x: uv.x,
+                uv_y: uv.y,
+                color: [0.4, 0.6, 0.3, 1.0],
+            })
+            .collect::<Vec<_>>();
+
+        let vertex_buffer_size = (vertices.len() * std::mem::size_of::<Vertex>()) as vk::DeviceSize;
+        let index_buffer_size = (self.indices.len() * std::mem::size_of::<u32>()) as vk::DeviceSize;
+        let vertex_buffer = AllocatedBuffer::new(
+            &ctx.device,
+            &mut ctx.allocator.borrow_mut(),
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            AllocUsage::GpuOnly,
+            vertex_buffer_size,
+            Some("Vertex Buffer".into()),
+        );
+        let device_address_info = vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer);
+        let buffer_device_address = unsafe { ctx.device.get_buffer_device_address(&device_address_info) };
+        let index_buffer = AllocatedBuffer::new(
+            &ctx.device,
+            &mut ctx.allocator.borrow_mut(),
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            AllocUsage::GpuOnly,
+            index_buffer_size,
+            Some("Index Buffer".into()),
+        );
+
+        let mut staging = AllocatedBuffer::new(
+            &ctx.device,
+            &mut ctx.allocator.borrow_mut(),
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            AllocUsage::Shared,
+            vertex_buffer_size + index_buffer_size,
+            Some("Staging Buffer".into()),
+        );
+
+        let map = unsafe {
+            staging
+                .allocation
+                .map(AshMemoryDevice::wrap(&ctx.device), 0, staging.size as usize)
+                .unwrap()
+        };
+        // copy vertex buffer
+        let vertex_buffer_ptr = map.as_ptr() as *mut Vertex;
+        unsafe {
+            vertex_buffer_ptr.copy_from_nonoverlapping(vertices.as_ptr(), vertices.len());
+            let index_buffer_ptr = vertex_buffer_ptr.add(vertices.len()) as *mut u32;
+            index_buffer_ptr.copy_from_nonoverlapping(self.indices.as_ptr(), self.indices.len());
+        };
+
+        let vertex_copy = vk::BufferCopy {
+            src_offset: 0,
+            dst_offset: 0,
+            size: vertex_buffer_size,
+        };
+        unsafe {
+            ctx.device
+                .cmd_copy_buffer(ctx.cmd_buffer, staging.buffer, vertex_buffer.buffer, &[vertex_copy]);
+        };
+        let index_copy = vk::BufferCopy {
+            src_offset: vertex_buffer_size,
+            dst_offset: 0,
+            size: index_buffer_size,
+        };
+        unsafe {
+            ctx.device.cmd_copy_buffer(ctx.cmd_buffer, staging.buffer, index_buffer.buffer, &[index_copy]);
+        };
+        // return empty FnOnce closure
+
+        self.mem = Some(GpuMesh {
+            vertex_buffer,
+            vertex_address: buffer_device_address,
+            index_buffer,
+        });
+
+        ctx.cleanup = Some(Box::from(move |device: &Device, allocator: &mut Allocator| {
+            staging.destroy(device, allocator);
+        }));
+    }
+}
+
 pub const SWAPCHAIN_IMAGE_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 pub const API_VERSION: u32 = vk::make_api_version(0, 1, 3, 0);
 
-type ImmediateSubmitFn<'a> = Box<dyn (Fn(&mut App, vk::CommandBuffer) -> Box<dyn (FnOnce(&Device, &mut Allocator))>) + 'a>;
 
 impl App {
     fn new(event_loop: &EventLoop<()>) -> Result<Self, Box<dyn Error>> {
         let window_size = (800, 600);
         let (instance, surface_khr, surface, entry, window) = unsafe {
             let entry = ash::Entry::load()?;
-            let surface_extensions = ash_window::enumerate_required_extensions(event_loop.raw_display_handle())?;
-            let app_desc = vk::ApplicationInfo::builder().api_version(API_VERSION);
-            let instance_desc = vk::InstanceCreateInfo::builder()
+            let surface_extensions = ash_window::enumerate_required_extensions(event_loop.display_handle()?.as_raw())?;
+            let app_desc = vk::ApplicationInfo::default().api_version(API_VERSION);
+            let instance_desc = vk::InstanceCreateInfo::default()
                 .application_info(&app_desc)
                 .enabled_extension_names(surface_extensions);
 
@@ -111,15 +256,14 @@ impl App {
                 .build(event_loop)?;
 
             // Create a surface from winit window.
-            let surface_khr = ash_window::create_surface(&entry, &instance, window.raw_display_handle(), window.raw_window_handle(), None)?;
-            let surface = Surface::new(&entry, &instance);
+            let surface_khr = ash_window::create_surface(&entry, &instance, window.display_handle()?.as_raw(), window.window_handle()?.as_raw(), None)?;
+            let surface = khr::surface::Instance::new(&entry, &instance);
             (instance, surface_khr, surface, entry, window)
         };
         let mut deletion_queue = DeletionQueue::default();
         let physical_device = device_discovery::pick_physical_device(&instance, &surface, surface_khr);
         let (device, graphics_queue, present_queue) =
             Self::create_logical_device_and_queue(&instance, &surface, surface_khr, physical_device);
-
         let config = gpu_alloc::Config::i_am_prototyping();
         let device_properties = unsafe { device_properties(&instance, API_VERSION, physical_device)? };
         let mut allocator = GpuAllocator::new(config, device_properties);
@@ -140,7 +284,7 @@ impl App {
             surface: surface_khr,
             surface_fn: surface,
             physical_device,
-            device,
+            device: Rc::new(device),
             graphics_queue,
             present_queue,
             swapchain: (swapchain, swapchain_khr),
@@ -150,7 +294,7 @@ impl App {
             current_frame: 0,
             window,
             window_size,
-            allocator,
+            allocator: Rc::new(RefCell::new(allocator)),
             main_deletion_queue: deletion_queue,
             draw_image: Some(draw_image), // must be present at all times, Option<_> because we need ownership when destroying
             depth_image: Some(depth_image),
@@ -181,7 +325,7 @@ impl App {
     /// Pick the first physical device that supports graphics and presentation queue families.
     fn create_logical_device_and_queue(
         instance: &Instance,
-        surface: &Surface,
+        surface: &khr::surface::Instance,
         surface_khr: vk::SurfaceKHR,
         device: vk::PhysicalDevice,
     ) -> (Device, (vk::Queue, u32), (vk::Queue, u32)) {
@@ -189,29 +333,26 @@ impl App {
         let graphics_family_index = graphics_family_index.unwrap();
         let present_family_index = present_family_index.unwrap();
 
-        let queue_create_infos = {
-            // Vulkan specs does not allow passing an array containing duplicated family indices.
-            // And since the family for graphics and presentation could be the same we need to
-            // deduplicate it.
-            let mut indices = vec![graphics_family_index, present_family_index];
-            indices.dedup();
+        // Vulkan specs does not allow passing an array containing duplicated family indices.
+        // And since the family for graphics and presentation could be the same we need to
+        // deduplicate it.
+        let mut indices = vec![graphics_family_index, present_family_index];
+        indices.dedup();
 
-            // Now we build an array of `DeviceQueueCreateInfo`.
-            // One for each different family index.
-            let queue_priorities = [1.0f32];
-            indices
-                .iter()
-                .map(|index| {
-                    vk::DeviceQueueCreateInfo::builder()
-                        .queue_family_index(*index)
-                        .queue_priorities(&queue_priorities)
-                        .build()
-                })
-                .collect::<Vec<_>>()
-        };
+        // Now we build an array of `DeviceQueueCreateInfo`.
+        // One for each different family index.
+        let queue_priorities = [1.0f32];
+        let queue_create_infos = indices
+            .iter()
+            .map(|index| {
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(*index)
+                    .queue_priorities(&queue_priorities)
+            })
+            .collect::<Vec<_>>();
 
-        let device_features = vk::PhysicalDeviceFeatures::builder().build();
-        let mut vk12_features = vk::PhysicalDeviceVulkan12Features::builder()
+        let device_features = vk::PhysicalDeviceFeatures::default();
+        let mut vk12_features = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
             .descriptor_indexing(true)
             .runtime_descriptor_array(true)
@@ -221,26 +362,23 @@ impl App {
             .shader_sampled_image_array_non_uniform_indexing(true)
             .descriptor_binding_storage_buffer_update_after_bind(true)
             .descriptor_binding_storage_image_update_after_bind(true)
-            .descriptor_binding_sampled_image_update_after_bind(true)
-            .build();
-        let mut vk13_features = vk::PhysicalDeviceVulkan13Features::builder()
+            .descriptor_binding_sampled_image_update_after_bind(true);
+        let mut vk13_features = vk::PhysicalDeviceVulkan13Features::default()
             .synchronization2(true)
-            .dynamic_rendering(true)
-            .build();
+            .dynamic_rendering(true);
 
-        let binding = [Swapchain::name().as_ptr()];
-        let device_create_info_builder = vk::DeviceCreateInfo::builder()
+        let binding = [khr::swapchain::NAME.as_ptr()];
+        let device_create_info_builder = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(&binding)
             .enabled_features(&device_features)
             .push_next(&mut vk12_features)
             .push_next(&mut vk13_features);
-        let device_create_info = device_create_info_builder.build();
 
         // Build device and queues
         let device = unsafe {
             instance
-                .create_device(device, &device_create_info, None)
+                .create_device(device, &device_create_info_builder, None)
                 .expect("Failed to create logical device.")
         };
         let graphics_queue = unsafe { device.get_device_queue(graphics_family_index, 0) };
@@ -261,7 +399,7 @@ impl App {
         allocator: &mut Allocator,
         window_size: (u32, u32),
     ) -> (
-        (Swapchain, vk::SwapchainKHR),
+        (khr::swapchain::Device, vk::SwapchainKHR),
         Vec<vk::Image>,
         Vec<vk::ImageView>,
         AllocatedImage,
@@ -283,7 +421,7 @@ impl App {
 
             ..Default::default()
         };
-        let swapchain = Swapchain::new(instance, device);
+        let swapchain = swapchain::Device::new(instance, &device);
         let swapchain_khr = unsafe { swapchain.create_swapchain(&create_info, None).unwrap() };
 
         let images = unsafe { swapchain.get_swapchain_images(swapchain_khr).unwrap() };
@@ -291,7 +429,7 @@ impl App {
         let image_views = images
             .iter()
             .map(|image| {
-                let create_info = vk::ImageViewCreateInfo::builder()
+                let create_info = vk::ImageViewCreateInfo::default()
                     .image(*image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(SWAPCHAIN_IMAGE_FORMAT)
@@ -313,7 +451,7 @@ impl App {
             .collect::<Vec<_>>();
 
         let draw_image = AllocatedImage::new(
-            &device,
+            device,
             allocator,
             vk::Extent3D {
                 width: window_size.0,
@@ -331,7 +469,7 @@ impl App {
         );
 
         let depth_image = AllocatedImage::new(
-            &device,
+            device,
             allocator,
             vk::Extent3D {
                 width: window_size.0,
@@ -353,14 +491,14 @@ impl App {
         device: &Device,
         deletion_queue: &mut DeletionQueue,
     ) -> (vk::CommandPool, vk::CommandBuffer, vk::Fence, [FrameData; FRAME_OVERLAP]) {
-        let command_pool_create_info = vk::CommandPoolCreateInfo::builder()
+        let command_pool_create_info = vk::CommandPoolCreateInfo::default()
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER) // we want to be able to reset individual command buffers, not the entire pool at once
             .queue_family_index(queue_family_index);
-        let fence_create_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
-        let semaphore_create_info = vk::SemaphoreCreateInfo::builder();
+        let fence_create_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        let semaphore_create_info = vk::SemaphoreCreateInfo::default();
 
         let immediate_command_pool = unsafe { device.create_command_pool(&command_pool_create_info, None).unwrap() };
-        let immediate_alloc_info = vk::CommandBufferAllocateInfo::builder()
+        let immediate_alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(immediate_command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
@@ -379,7 +517,7 @@ impl App {
                 let command_buffer = unsafe {
                     device
                         .allocate_command_buffers(
-                            &vk::CommandBufferAllocateInfo::builder()
+                            &vk::CommandBufferAllocateInfo::default()
                                 .command_pool(command_pool)
                                 .level(vk::CommandBufferLevel::PRIMARY)
                                 .command_buffer_count(1),
@@ -424,7 +562,9 @@ impl App {
             }),
         )
     }
-
+    pub const STORAGE_BUFFER_BINDING: u32 = 0;
+    pub const STORAGE_IMAGE_BINDING: u32 = 1;
+    pub const TEXTURE_BINDING: u32 = 2;
     fn init_bindless(device: &Device) -> (DescriptorSet, DescriptorSetLayout) {
         let pool_sizes = [
             vk::DescriptorPoolSize {
@@ -443,7 +583,7 @@ impl App {
         let descriptor_pool = unsafe {
             device
                 .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::builder()
+                    &vk::DescriptorPoolCreateInfo::default()
                         .pool_sizes(&pool_sizes)
                         .max_sets(1)
                         .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
@@ -452,33 +592,30 @@ impl App {
                 .unwrap()
         };
         let bindings = [
-            vk::DescriptorSetLayoutBinding::builder()
-                .binding(0)
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(Self::STORAGE_BUFFER_BINDING)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(65536)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-                .build(),
-            vk::DescriptorSetLayoutBinding::builder()
-                .binding(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(Self::STORAGE_IMAGE_BINDING)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(65536)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-                .build(),
-            vk::DescriptorSetLayoutBinding::builder()
-                .binding(2)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(Self::TEXTURE_BINDING)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(65536)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-                .build(),
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
 
         let set_layout = unsafe {
             device
                 .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::builder()
+                    &vk::DescriptorSetLayoutCreateInfo::default()
                         .bindings(&bindings)
                         .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
-                        .push_next(&mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::builder().binding_flags(&[
+                        .push_next(&mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&[
                             vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
                             vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
                             vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
@@ -492,7 +629,7 @@ impl App {
             unsafe {
                 device
                     .allocate_descriptor_sets(
-                        &vk::DescriptorSetAllocateInfo::builder()
+                        &vk::DescriptorSetAllocateInfo::default()
                             .descriptor_pool(descriptor_pool)
                             .set_layouts(&[set_layout]),
                     )
@@ -518,7 +655,7 @@ impl App {
         }];
         let mut descriptor_pool = DescriptorAllocator::new(device, 1, &sizes);
         let builder = DescriptorLayoutBuilder::default().add_binding(0, vk::DescriptorType::STORAGE_IMAGE, vk::ShaderStageFlags::COMPUTE);
-        let layout = builder.build(device);
+        let layout = builder.build(&device);
         let descriptor_set = descriptor_pool.allocate(device, layout);
 
         update_set(device, descriptor_set, &[
@@ -560,8 +697,8 @@ impl App {
         unsafe {
             self.device.device_wait_idle().unwrap();
             self.destroy_swapchain();
-            self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator);
-            self.depth_image.take().unwrap().destroy(&self.device, &mut self.allocator);
+            self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator.borrow_mut());
+            self.depth_image.take().unwrap().destroy(&self.device, &mut self.allocator.borrow_mut());
         }
         self.window_size = size;
         let capabilities = unsafe {
@@ -574,7 +711,7 @@ impl App {
             &self.device,
             self.surface,
             capabilities,
-            &mut self.allocator,
+            &mut self.allocator.borrow_mut(),
             self.window_size,
         );
         self.swapchain = swapchain;
@@ -605,17 +742,17 @@ impl App {
         let index_buffer_size = (mesh.indices.len() * std::mem::size_of::<u32>()) as vk::DeviceSize;
         let vertex_buffer = AllocatedBuffer::new(
             &self.device,
-            &mut self.allocator,
+            &mut self.allocator.borrow_mut(),
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             AllocUsage::GpuOnly,
             vertex_buffer_size,
             Some("Vertex Buffer".into()),
         );
-        let device_address_info = vk::BufferDeviceAddressInfo::builder().buffer(vertex_buffer.buffer);
+        let device_address_info = vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer);
         let buffer_device_address = unsafe { self.device.get_buffer_device_address(&device_address_info) };
         let index_buffer = AllocatedBuffer::new(
             &self.device,
-            &mut self.allocator,
+            &mut self.allocator.borrow_mut(),
             vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             AllocUsage::GpuOnly,
             index_buffer_size,
@@ -624,7 +761,7 @@ impl App {
 
         let mut staging = AllocatedBuffer::new(
             &self.device,
-            &mut self.allocator,
+            &mut self.allocator.borrow_mut(),
             vk::BufferUsageFlags::TRANSFER_SRC,
             AllocUsage::Shared,
             vertex_buffer_size + index_buffer_size,
@@ -644,15 +781,16 @@ impl App {
             let index_buffer_ptr = vertex_buffer_ptr.add(vertices.len()) as *mut u32;
             index_buffer_ptr.copy_from_nonoverlapping(mesh.indices.as_ptr(), mesh.indices.len());
         };
-        self.immediate_submit(Box::new(move |this, cmd| {
+        let mut submit_ctx = SubmitContext::new(self);
+        submit_ctx.immediate_submit(Box::new(|ctx| {
             let vertex_copy = vk::BufferCopy {
                 src_offset: 0,
                 dst_offset: 0,
                 size: vertex_buffer_size,
             };
             unsafe {
-                this.device
-                    .cmd_copy_buffer(cmd, staging.buffer, vertex_buffer.buffer, &[vertex_copy]);
+                ctx.device
+                    .cmd_copy_buffer(ctx.cmd_buffer, staging.buffer, vertex_buffer.buffer, &[vertex_copy]);
             };
             let index_copy = vk::BufferCopy {
                 src_offset: vertex_buffer_size,
@@ -660,12 +798,13 @@ impl App {
                 size: index_buffer_size,
             };
             unsafe {
-                this.device.cmd_copy_buffer(cmd, staging.buffer, index_buffer.buffer, &[index_copy]);
+                ctx.device.cmd_copy_buffer(ctx.cmd_buffer, staging.buffer, index_buffer.buffer, &[index_copy]);
             };
-            // return empty FnOnce closure
-            Box::from(move |_: &Device, _: &mut Allocator| {})
+            ctx.cleanup = Some(Box::from(|device: &Device, allocator: &mut Allocator| {
+                staging.destroy(device, allocator);
+            }));
         }));
-        staging.destroy(&self.device, &mut self.allocator);
+
         GpuMesh {
             vertex_buffer,
             vertex_address: buffer_device_address,
@@ -674,28 +813,6 @@ impl App {
     }
 
     // https://i.imgflip.com/8l3uzz.jpg
-    fn immediate_submit<'a>(&'a mut self, cmd: ImmediateSubmitFn<'a>) {
-        let cmd_buffer = self.immediate_command_buffer;
-        unsafe {
-            self.device.reset_fences(&[self.immediate_fence]).unwrap();
-            self.device
-                .reset_command_buffer(cmd_buffer, vk::CommandBufferResetFlags::empty())
-                .unwrap();
-            let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.device.begin_command_buffer(cmd_buffer, &begin_info).unwrap();
-            let cleanup = cmd(self, cmd_buffer);
-            self.device.end_command_buffer(cmd_buffer).unwrap();
-            let cmd_buffer_submit = vk::CommandBufferSubmitInfo::builder().command_buffer(cmd_buffer);
-            let cmd_buffer_submits = [*cmd_buffer_submit];
-            let submit_info = vk::SubmitInfo2::builder().command_buffer_infos(&cmd_buffer_submits);
-            let submits = [*submit_info];
-            self.device
-                .queue_submit2(self.graphics_queue.0, &submits, self.immediate_fence)
-                .unwrap();
-            self.device.wait_for_fences(&[self.immediate_fence], true, 1000000000).unwrap();
-            cleanup(&self.device, &mut self.allocator);
-        }
-    }
     fn current_frame(&self) -> &FrameData {
         &self.frames[(self.current_frame % FRAME_OVERLAP as u32) as usize]
     }
@@ -703,43 +820,35 @@ impl App {
     fn init_textures(&mut self) {
         self.texture_manager.init_defaults(
             &self.device,
-            &mut self.allocator,
+            &mut self.allocator.borrow_mut(),
             self.bindless_descriptor_set,
             &mut self.main_deletion_queue,
         );
-        self.immediate_submit(Box::new(move |this: &mut App, cmd: vk::CommandBuffer| {
-            let white = [255u8, 255, 255, 255];
-            let black = [0u8, 0, 0, 255];
-            let magenta = [255u8, 0, 255, 255];
-            let pixels: [[u8; 4]; 16 * 16] = core::array::from_fn(|i| 
-                // create a checkerboard pattern of white and magenta
-                if (i / 16 + i % 16) % 2 == 0 {
-                    white
-                } else {
-                    magenta
-                }
-                
-            );
-            let pixel_data = pixels.iter().flat_map(|p| p.iter().copied()).collect::<Vec<_>>();
+        let white = [255u8, 255, 255, 255];
+        let black = [0u8, 0, 0, 255];
+        let magenta = [255u8, 0, 255, 255];
+        let pixels: [[u8; 4]; 16 * 16] = core::array::from_fn(|i|
+            // create a checkerboard pattern of white and magenta
+            if (i / 16 + i % 16) % 2 == 0 {
+                white
+            } else {
+                magenta
+            }
+        );
+        let pixel_data = pixels.iter().flat_map(|p| p.iter().copied()).collect::<Vec<_>>();
 
-            let cleanup_white = this.texture_manager.textures[0]
-                .image
-                .write(&white, &this.device, &mut this.allocator, cmd);
+        SubmitContext::new(self).immediate_submit(Box::new(|ctx| self.texture_manager.textures[0]
+            .image
+            .write(&white, ctx)));
 
-            let cleanup_black = this.texture_manager.textures[1]
-                .image
-                .write(&black, &this.device, &mut this.allocator, cmd);
+        SubmitContext::new(self).immediate_submit(Box::new(|ctx| self.texture_manager.textures[1]
+            .image
+            .write(&black, ctx)));
 
-            let cleanup_checkerboard = this.texture_manager.textures[2]
-                .image
-                .write(&pixel_data, &this.device, &mut this.allocator, cmd);
 
-            Box::new(move |device: &Device, allocator: &mut Allocator| {
-                cleanup_white(device, allocator);
-                cleanup_black(device, allocator);
-                cleanup_checkerboard(device, allocator);
-            })
-        }));
+        SubmitContext::new(self).immediate_submit(Box::new(|ctx| self.texture_manager.textures[2]
+            .image
+            .write(&pixel_data, ctx)));
     }
 
     fn draw(&mut self) {
@@ -752,7 +861,7 @@ impl App {
             frame!(self).deletion_queue.flush(&device);
             frame!(self).descriptor_allocator.clear_pools(&device);
             for buffer in frame!(self).stale_buffers.drain(..) {
-                buffer.destroy(&device, &mut self.allocator);
+                buffer.destroy(&device, &mut self.allocator.borrow_mut());
             }
             self.device.reset_fences(&[self.current_frame().render_fence]).unwrap();
 
@@ -773,7 +882,7 @@ impl App {
                 .unwrap();
 
             //begin command buffer recording
-            let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.device.begin_command_buffer(cmd_buffer, &begin_info).unwrap();
 
             // transition draw image into writable mode before rendering. undefined = we don't care, we're fine with the GPU destroying the image. general = general purpose layout which allows reading and writing from the image.
@@ -804,7 +913,7 @@ impl App {
 
             let mut scene_data_buffer = AllocatedBuffer::new(
                 &self.device,
-                &mut self.allocator,
+                &mut self.allocator.borrow_mut(),
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
                 AllocUsage::Shared,
                 std::mem::size_of::<GpuSceneData>() as vk::DeviceSize,
@@ -819,7 +928,7 @@ impl App {
             let scene_data_ptr = map.as_ptr() as *mut GpuSceneData;
             scene_data_ptr.copy_from_nonoverlapping(&self.scene_data, 1);
             let global_descriptor = frame!(self).descriptor_allocator.allocate(&self.device, self.scene_data_layout);
-            
+
             update_set(&self.device, global_descriptor, &[], &[
                 DescriptorBufferWriteInfo {
                     binding: 0,
@@ -830,7 +939,7 @@ impl App {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
                 }
             ]);
-            
+
             frame!(self).stale_buffers.push(scene_data_buffer);
 
             self.mesh_pipeline.draw(
@@ -884,20 +993,22 @@ impl App {
             self.device.end_command_buffer(cmd_buffer).unwrap();
 
             // submit command buffer to queue
-            let cmd_buffer_submit_info = vk::CommandBufferSubmitInfo::builder().command_buffer(cmd_buffer);
+            let cmd_buffer_submit_info = vk::CommandBufferSubmitInfo::default().command_buffer(cmd_buffer);
             // we want to wait on the swapchain semaphore, as that signals when the swapchain image is available for rendering
-            let wait_info = vk::SemaphoreSubmitInfo::builder()
+            let wait_info = vk::SemaphoreSubmitInfo::default()
                 .semaphore(self.current_frame().swapchain_semaphore)
                 .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
             // we want to signal the render semaphore, as that signals when the rendering is done
-            let signal_info = vk::SemaphoreSubmitInfo::builder()
+            let signal_info = vk::SemaphoreSubmitInfo::default()
                 .semaphore(self.current_frame().render_semaphore)
                 .stage_mask(vk::PipelineStageFlags2::ALL_GRAPHICS);
-            let submit = vk::SubmitInfo2::builder()
-                .command_buffer_infos(&[*cmd_buffer_submit_info])
-                .wait_semaphore_infos(&[*wait_info])
-                .signal_semaphore_infos(&[*signal_info])
-                .build();
+            let command_buffer_infos = [cmd_buffer_submit_info];
+            let wait_infos = [wait_info];
+            let signal_semaphore_infos = [signal_info];
+            let submit = vk::SubmitInfo2::default()
+                .command_buffer_infos(&command_buffer_infos)
+                .wait_semaphore_infos(&wait_infos)
+                .signal_semaphore_infos(&signal_semaphore_infos);
             self.device
                 .queue_submit2(self.graphics_queue.0, &[submit], self.current_frame().render_fence)
                 .unwrap();
@@ -906,7 +1017,7 @@ impl App {
             let swapchains = [self.swapchain.1];
             let indices = [image_index];
             let semaphores = [self.current_frame().render_semaphore];
-            let present_info = vk::PresentInfoKHR::builder()
+            let present_info = vk::PresentInfoKHR::default()
                 .swapchains(&swapchains)
                 .image_indices(&indices)
                 .wait_semaphores(&semaphores);
@@ -916,7 +1027,7 @@ impl App {
     }
 
     fn draw_background(&self, cmd: vk::CommandBuffer) {
-        let clear_range = vk::ImageSubresourceRange::builder()
+        let clear_range = vk::ImageSubresourceRange::default()
             .level_count(vk::REMAINING_MIP_LEVELS)
             .layer_count(vk::REMAINING_ARRAY_LAYERS)
             .aspect_mask(vk::ImageAspectFlags::COLOR);
@@ -929,7 +1040,7 @@ impl App {
                 &vk::ClearColorValue {
                     float32: [0.0, 0.0, 0.0, 1.0],
                 },
-                &[clear_range.build()],
+                &[clear_range],
             );
         }
     }
@@ -943,14 +1054,14 @@ impl Drop for App {
             self.descriptor_allocator.destroy_pools(&self.device);
             for mesh in self.meshes.drain(..) {
                 let mem = mesh.mem.unwrap();
-                mem.index_buffer.destroy(&self.device, &mut self.allocator);
-                mem.vertex_buffer.destroy(&self.device, &mut self.allocator);
+                mem.index_buffer.destroy(&self.device, &mut self.allocator.borrow_mut());
+                mem.vertex_buffer.destroy(&self.device, &mut self.allocator.borrow_mut());
             }
 
-            self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator);
-            self.depth_image.take().unwrap().destroy(&self.device, &mut self.allocator);
+            self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator.borrow_mut());
+            self.depth_image.take().unwrap().destroy(&self.device, &mut self.allocator.borrow_mut());
             for image in self.images.drain(..) {
-                image.destroy(&self.device, &mut self.allocator);
+                image.destroy(&self.device, &mut self.allocator.borrow_mut());
             }
             for sampler in self.samplers.drain(..) {
                 self.device.destroy_sampler(sampler, None);
@@ -958,7 +1069,7 @@ impl Drop for App {
             for frame in self.frames.iter_mut() {
                 frame.deletion_queue.flush(&self.device); // take care of frames that were prepared but not reached in the render loop yet
                 for buffer in frame.stale_buffers.drain(..) {
-                    buffer.destroy(&self.device, &mut self.allocator);
+                    buffer.destroy(&self.device, &mut self.allocator.borrow_mut());
                 }
 
                 self.device.destroy_command_pool(frame.command_pool, None);
@@ -979,32 +1090,33 @@ fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
     let event_loop = EventLoop::new();
 
-    let mut app = App::new(&event_loop)?;
+    let mut app = App::new(event_loop.as_ref().unwrap())?;
     let models = gltf::load_gltf(Path::new("src/assets/cube_light_tan.glb"));
     let meshes = models.into_iter().flat_map(|mo| mo.meshes).collect::<Vec<_>>();
     info!("Loaded gltf with {} meshes", meshes.len());
+
     for mut mesh in meshes {
-        let gpu = app.upload_mesh(&mesh);
-        mesh.mem = Some(gpu);
+        let mut submit_ctx = SubmitContext::new(&mut app);
+        submit_ctx.immediate_submit(Box::new(|ctx| mesh.upload(ctx)));
+
         app.meshes.push(mesh);
     }
     app.init_textures();
 
-    event_loop.run(move |event, _, control_flow| match event {
+    Ok(event_loop.unwrap().run(move |event, target| match event {
         Event::WindowEvent {
             event:
-                WindowEvent::CloseRequested
-                | WindowEvent::KeyboardInput {
-                    input:
-                        winit::event::KeyboardInput {
-                            virtual_keycode: Some(VirtualKeyCode::Escape),
-                            ..
-                        },
+            WindowEvent::CloseRequested
+            | WindowEvent::KeyboardInput {
+                event: winit::event::KeyEvent {
+                    logical_key: winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape),
                     ..
                 },
+                ..
+            },
             window_id: _,
         } => {
-            *control_flow = ControlFlow::Exit;
+            target.exit();
         }
         Event::WindowEvent {
             event: WindowEvent::Resized(size),
@@ -1012,12 +1124,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         } => {
             app.resize((size.width, size.height));
         }
-        Event::MainEventsCleared => {
+        Event::WindowEvent {
+            event: WindowEvent::RedrawRequested,
+            ..
+        } => {
+            app.draw();
             app.window.request_redraw();
         }
-        Event::RedrawRequested(..) => {
-            app.draw();
-        }
         _ => {}
-    })
+    })?)
 }
