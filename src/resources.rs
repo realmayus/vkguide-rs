@@ -1,6 +1,8 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use crate::pipeline::Vertex;
 use crate::util::{DeletionQueue, transition_image};
-use crate::{App, ImmediateSubmitFn};
+use crate::{App, SubmitContext};
 use ash::prelude::VkResult;
 use ash::vk::{DeviceMemory, DeviceSize};
 use ash::{vk, Device};
@@ -17,12 +19,14 @@ pub struct PoolSizeRatio {
     pub(crate) descriptor_type: vk::DescriptorType,
     pub(crate) ratio: f32,
 }
+
 pub struct DescriptorAllocator {
     ratios: Vec<PoolSizeRatio>,
     ready_pools: Vec<vk::DescriptorPool>,
     full_pools: Vec<vk::DescriptorPool>,
     sets_per_pool: u32,
 }
+
 impl DescriptorAllocator {
     pub fn new(device: &Device, max_sets: u32, pool_sizes: &[PoolSizeRatio]) -> Self {
         let pool = Self::create_pool(device, pool_sizes, max_sets);
@@ -56,13 +60,13 @@ impl DescriptorAllocator {
     pub fn allocate(&mut self, device: &Device, layout: vk::DescriptorSetLayout) -> vk::DescriptorSet {
         let pool = self.get_or_create_pool(device);
         let layouts = [layout];
-        let allocate_info = vk::DescriptorSetAllocateInfo::builder().descriptor_pool(pool).set_layouts(&layouts);
+        let allocate_info = vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts);
         let (pool, descriptor_set) = match unsafe { device.allocate_descriptor_sets(&allocate_info) } {
             Ok(res) => (pool, res[0]),
             Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY) | Err(vk::Result::ERROR_FRAGMENTED_POOL) => {
                 self.full_pools.push(pool);
                 let new_pool = self.get_or_create_pool(device);
-                let new_allocate_info = vk::DescriptorSetAllocateInfo::builder()
+                let new_allocate_info = vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(new_pool)
                     .set_layouts(&layouts);
                 (new_pool, unsafe {
@@ -98,7 +102,7 @@ impl DescriptorAllocator {
                 descriptor_count: (sets_per_pool as f32 * pool_size.ratio).ceil() as u32,
             })
             .collect();
-        let info = vk::DescriptorPoolCreateInfo::builder()
+        let info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(sets_per_pool)
             .pool_sizes(&pool_sizes);
         let pool = unsafe { device.create_descriptor_pool(&info, None).unwrap() };
@@ -134,7 +138,7 @@ pub fn update_set(device: &Device, set: vk::DescriptorSet, image_writes: &[Descr
     }]).collect::<Vec<_>>();
     for (i, write) in buffer_writes.iter().enumerate() {
         writes.push(
-            vk::WriteDescriptorSet::builder()
+            vk::WriteDescriptorSet::default()
                 .dst_binding(write.binding)
                 .dst_set(set)
                 .dst_array_element(write.array_index)
@@ -148,9 +152,8 @@ pub fn update_set(device: &Device, set: vk::DescriptorSet, image_writes: &[Descr
         image_layout: write.layout,
     }]).collect::<Vec<_>>();
     for (i, write) in image_writes.iter().enumerate() {
-
         writes.push(
-            vk::WriteDescriptorSet::builder()
+            vk::WriteDescriptorSet::default()
                 .dst_binding(write.binding)
                 .dst_set(set)
                 .dst_array_element(write.array_index)
@@ -158,10 +161,10 @@ pub fn update_set(device: &Device, set: vk::DescriptorSet, image_writes: &[Descr
                 .image_info(&image_infos[i])
         );
     }
-    
+
     // println!("Writes: {:#?}", writes);
 
-    unsafe { device.update_descriptor_sets(&writes.into_iter().map(|x| x.build()).collect::<Vec<_>>(), &[]) }
+    unsafe { device.update_descriptor_sets(&writes, &[]) }
 }
 
 pub struct AllocatedBuffer {
@@ -180,7 +183,7 @@ impl AllocatedBuffer {
         size: DeviceSize,
         label: Option<String>,
     ) -> Self {
-        let info = vk::BufferCreateInfo::builder().size(size).usage(buffer_usages);
+        let info = vk::BufferCreateInfo::default().size(size).usage(buffer_usages);
         let buffer = unsafe { device.create_buffer(&info, None) }.unwrap();
         let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
         let allocation = unsafe {
@@ -275,7 +278,7 @@ impl AllocatedImage {
         image_aspect: vk::ImageAspectFlags,
         label: Option<String>,
     ) -> Self {
-        let info = vk::ImageCreateInfo::builder()
+        let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(extent)
@@ -289,6 +292,7 @@ impl AllocatedImage {
         let reqs = unsafe { device.get_image_memory_requirements(image) };
         let allocation = unsafe {
             allocator
+
                 .alloc(
                     AshMemoryDevice::wrap(&device),
                     gpu_alloc::Request {
@@ -311,26 +315,24 @@ impl AllocatedImage {
         }
         unsafe { device.bind_image_memory(image, *allocation.memory(), allocation.offset()).unwrap() };
 
-        let view_create_info = vk::ImageViewCreateInfo::builder()
+        let view_create_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(format)
             .components(
-                vk::ComponentMapping::builder()
+                vk::ComponentMapping::default()
                     .r(vk::ComponentSwizzle::IDENTITY)
                     .g(vk::ComponentSwizzle::IDENTITY)
                     .b(vk::ComponentSwizzle::IDENTITY)
-                    .a(vk::ComponentSwizzle::IDENTITY)
-                    .build(),
+                    .a(vk::ComponentSwizzle::IDENTITY),
             )
             .subresource_range(
-                vk::ImageSubresourceRange::builder()
+                vk::ImageSubresourceRange::default()
                     .aspect_mask(image_aspect)
                     .base_mip_level(0)
                     .level_count(1)
                     .base_array_layer(0)
-                    .layer_count(1)
-                    .build(),
+                    .layer_count(1),
             );
         let view = unsafe { device.create_image_view(&view_create_info, None).unwrap() };
         Self {
@@ -344,62 +346,61 @@ impl AllocatedImage {
     }
 
     // https://i.imgflip.com/8l3uzz.jpg
-    pub fn write<'a>(&'a self, data: &'a [u8], device: &Device, allocator: &mut Allocator, cmd: vk::CommandBuffer) -> Box<dyn (FnOnce(&Device, &mut Allocator))> {
-            let mut staging = AllocatedBuffer::new(
-                device,
-                allocator,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                AllocUsage::UploadToHost,
-                data.len() as DeviceSize,
-                Some(format!("Staging buffer for image '{}'", self.label.clone().unwrap_or_default())),
-            );
-            unsafe {
-                let data_ptr = staging
-                    .allocation
-                    .map(AshMemoryDevice::wrap(device), 0, staging.size as usize)
-                    .unwrap();
-                std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr.as_ptr(), data.len());
-            }
-            transition_image(
-                device,
-                cmd,
-                self.image,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            );
-            let copy_region = vk::BufferImageCopy::builder()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(
-                    vk::ImageSubresourceLayers::builder()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .mip_level(0)
-                        .base_array_layer(0)
-                        .layer_count(1)
-                        .build(),
-                )
-                .image_extent(self.extent);
-            let copy_regions = [*copy_region];
-            unsafe {
-                device.cmd_copy_buffer_to_image(
-                    cmd,
-                    staging.buffer,
-                    self.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &copy_regions,
-                );
-            }
-            transition_image(
-                device,
-                cmd,
+    pub fn write<'a>(&'a self, data: &'a [u8], ctx: &mut SubmitContext) {
+        let mut staging = AllocatedBuffer::new(
+            &ctx.device,
+            &mut ctx.allocator.borrow_mut(),
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            AllocUsage::UploadToHost,
+            data.len() as DeviceSize,
+            Some(format!("Staging buffer for image '{}'", self.label.clone().unwrap_or_default())),
+        );
+        unsafe {
+            let data_ptr = staging
+                .allocation
+                .map(AshMemoryDevice::wrap(&ctx.device), 0, staging.size as usize)
+                .unwrap();
+            std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr.as_ptr(), data.len());
+        }
+        transition_image(
+            &ctx.device,
+            ctx.cmd_buffer,
+            self.image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        let copy_region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .image_extent(self.extent);
+        let copy_regions = [copy_region];
+        unsafe {
+            ctx.device.cmd_copy_buffer_to_image(
+                ctx.cmd_buffer,
+                staging.buffer,
                 self.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                &copy_regions,
             );
-            Box::from(|device: &Device, allocator: &mut Allocator| {
-                staging.destroy(device, allocator);
-            })
+        }
+        transition_image(
+            &ctx.device,
+            ctx.cmd_buffer,
+            self.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+        ctx.cleanup = Some(Box::from(|device: &Device, allocator: &mut Allocator| {
+            staging.destroy(device, allocator);
+        }))
     }
 
     pub(crate) fn destroy(self, device: &Device, allocator: &mut Allocator) {
@@ -494,14 +495,14 @@ impl TextureManager {
             vk::ImageAspectFlags::COLOR,
             Some("Checkerboard Image".into()),
         );
-        let sampler_info = vk::SamplerCreateInfo::builder()
+        let sampler_info = vk::SamplerCreateInfo::default()
             .address_mode_u(vk::SamplerAddressMode::REPEAT)
             .address_mode_v(vk::SamplerAddressMode::REPEAT)
             .address_mode_w(vk::SamplerAddressMode::REPEAT)
             .mag_filter(vk::Filter::NEAREST)
             .min_filter(vk::Filter::NEAREST);
         let sampler_nearest = unsafe { device.create_sampler(&sampler_info, None).unwrap() };
-        let sampler_info = vk::SamplerCreateInfo::builder()
+        let sampler_info = vk::SamplerCreateInfo::default()
             .address_mode_u(vk::SamplerAddressMode::REPEAT)
             .address_mode_v(vk::SamplerAddressMode::REPEAT)
             .address_mode_w(vk::SamplerAddressMode::REPEAT)

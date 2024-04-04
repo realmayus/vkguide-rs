@@ -40,19 +40,18 @@ impl DeletionQueue {
 }
 
 #[derive(Default)]
-pub struct DescriptorLayoutBuilder {
-    bindings: Vec<vk::DescriptorSetLayoutBinding>,
+pub struct DescriptorLayoutBuilder<'a> {
+    bindings: Vec<vk::DescriptorSetLayoutBinding<'a>>,
 }
 
-impl DescriptorLayoutBuilder {
+impl DescriptorLayoutBuilder<'_> {
     pub fn add_binding(mut self, binding: u32, descriptor_type: vk::DescriptorType, stage_flags: vk::ShaderStageFlags) -> Self {
         self.bindings.push(
-            vk::DescriptorSetLayoutBinding::builder()
+            vk::DescriptorSetLayoutBinding::default()
                 .binding(binding)
                 .descriptor_type(descriptor_type)
                 .descriptor_count(1)
-                .stage_flags(stage_flags)
-                .build(),
+                .stage_flags(stage_flags),
         );
         self
     }
@@ -62,17 +61,17 @@ impl DescriptorLayoutBuilder {
     }
 
     pub fn build(self, device: &Device) -> vk::DescriptorSetLayout {
-        let info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(&self.bindings);
+        let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&self.bindings);
         unsafe { device.create_descriptor_set_layout(&info, None) }.unwrap()
     }
 }
 pub mod device_discovery {
-    use ash::extensions::khr::Surface;
-    use ash::{vk, Instance};
+    use ash::{vk, Instance, khr};
     use log::info;
     use std::ffi::CStr;
+    use ash::khr::surface;
 
-    pub(crate) fn pick_physical_device(instance: &Instance, surface: &Surface, surface_khr: vk::SurfaceKHR) -> vk::PhysicalDevice {
+    pub(crate) fn pick_physical_device(instance: &Instance, surface: &khr::surface::Instance, surface_khr: vk::SurfaceKHR) -> vk::PhysicalDevice {
         let devices = unsafe { instance.enumerate_physical_devices().unwrap() };
         let device = devices
             .into_iter()
@@ -86,13 +85,13 @@ pub mod device_discovery {
         device
     }
 
-    fn is_device_suitable(instance: &Instance, surface: &Surface, surface_khr: vk::SurfaceKHR, device: vk::PhysicalDevice) -> bool {
+    fn is_device_suitable(instance: &Instance, surface: &khr::surface::Instance, surface_khr: vk::SurfaceKHR, device: vk::PhysicalDevice) -> bool {
         let (graphics, present) = find_queue_families(instance, surface, surface_khr, device);
         graphics.is_some() && present.is_some()
     }
     pub(crate) fn find_queue_families(
         instance: &Instance,
-        surface: &Surface,
+        surface: &khr::surface::Instance,
         surface_khr: vk::SurfaceKHR,
         device: vk::PhysicalDevice,
     ) -> (Option<u32>, Option<u32>) {
@@ -128,7 +127,7 @@ pub(crate) fn transition_image(
     current_layout: vk::ImageLayout,
     new_layout: vk::ImageLayout,
 ) {
-    let image_barrier = vk::ImageMemoryBarrier2::builder()
+    let image_barrier = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
         .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
         .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
@@ -136,7 +135,7 @@ pub(crate) fn transition_image(
         .old_layout(current_layout)
         .new_layout(new_layout)
         .subresource_range(
-            vk::ImageSubresourceRange::builder()
+            vk::ImageSubresourceRange::default()
                 .aspect_mask(if new_layout == vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL {
                     vk::ImageAspectFlags::DEPTH
                 } else {
@@ -144,13 +143,13 @@ pub(crate) fn transition_image(
                 })
                 .level_count(vk::REMAINING_MIP_LEVELS)
                 .layer_count(vk::REMAINING_ARRAY_LAYERS)
-                .build(),
+            ,
         )
         .image(image);
 
-    let dependency_info = vk::DependencyInfoKHR::builder()
-        .image_memory_barriers(&[image_barrier.build()])
-        .build();
+    let binding = [image_barrier];
+    let dependency_info = vk::DependencyInfoKHR::default()
+        .image_memory_barriers(&binding);
 
     unsafe { device.cmd_pipeline_barrier2(cmd, &dependency_info) }
 }
@@ -163,7 +162,7 @@ pub(crate) fn copy_image_to_image(
     src_extent: vk::Extent2D,
     dst_extent: vk::Extent2D,
 ) {
-    let blit_region = vk::ImageBlit2::builder()
+    let blit_region = vk::ImageBlit2::default()
         .src_offsets([
             vk::Offset3D { x: 0, y: 0, z: 0 },
             vk::Offset3D {
@@ -181,24 +180,23 @@ pub(crate) fn copy_image_to_image(
             },
         ])
         .src_subresource(
-            vk::ImageSubresourceLayers::builder()
+            vk::ImageSubresourceLayers::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .mip_level(0)
                 .base_array_layer(0)
-                .layer_count(1)
-                .build(),
+                .layer_count(1),
         )
         .dst_subresource(
-            vk::ImageSubresourceLayers::builder()
+            vk::ImageSubresourceLayers::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .mip_level(0)
                 .base_array_layer(0)
                 .layer_count(1)
-                .build(),
+            ,
         );
 
-    let regions = [*blit_region];
-    let blit_info = vk::BlitImageInfo2::builder()
+    let regions = [blit_region];
+    let blit_info = vk::BlitImageInfo2::default()
         .src_image(source)
         .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
         .dst_image(destination)
@@ -221,7 +219,7 @@ pub fn load_shader_module(device: &Device, code: &[u8]) -> Result<vk::ShaderModu
             u32::from_ne_bytes(bytes)
         })
         .collect();
-    let info = vk::ShaderModuleCreateInfo::builder().code(&code);
+    let info = vk::ShaderModuleCreateInfo::default().code(&code);
     unsafe { Ok(device.create_shader_module(&info, None)?) }
 }
 
