@@ -1,9 +1,6 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-use crate::pipeline::Vertex;
-use crate::util::{DeletionQueue, transition_image};
-use crate::{App, SubmitContext};
-use ash::prelude::VkResult;
+use crate::util::{transition_image};
+use crate::{SubmitContext};
+
 use ash::vk::{DeviceMemory, DeviceSize};
 use ash::{vk, Device};
 use gpu_alloc_ash::AshMemoryDevice;
@@ -189,7 +186,7 @@ impl AllocatedBuffer {
         let allocation = unsafe {
             allocator
                 .alloc(
-                    AshMemoryDevice::wrap(&device),
+                    AshMemoryDevice::wrap(device),
                     gpu_alloc::Request {
                         size: reqs.size,
                         align_mask: reqs.alignment - 1,
@@ -258,6 +255,7 @@ impl AllocUsage {
     }
 }
 
+#[derive(Debug)]
 pub struct AllocatedImage {
     pub image: vk::Image,
     pub view: vk::ImageView,
@@ -294,7 +292,7 @@ impl AllocatedImage {
             allocator
 
                 .alloc(
-                    AshMemoryDevice::wrap(&device),
+                    AshMemoryDevice::wrap(device),
                     gpu_alloc::Request {
                         size: reqs.size,
                         align_mask: reqs.alignment - 1,
@@ -419,134 +417,171 @@ impl AllocatedImage {
     }
 }
 
+pub type SamplerId = usize;
+pub type TextureId = usize;
+
+#[derive(Debug)]
 pub struct Texture {
+    pub id: TextureId,
     pub image: AllocatedImage,
+    sampler: SamplerId,  // rust doesn't like self-referential structs (samplers also live in TextureManager)
+}
+
+impl Texture {
+    pub fn new(sampler: SamplerId, ctx: &mut SubmitContext, label: Option<String>, data: &[u8], extent: vk::Extent3D) -> Self {
+        let img = AllocatedImage::new(
+            &ctx.device,
+            &mut ctx.allocator.borrow_mut(),
+            extent,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            AllocUsage::GpuOnly,
+            vk::ImageAspectFlags::COLOR,
+            label,
+        );
+
+        img.write(data, ctx);
+
+        Self {
+            image: img,
+            id: 0,
+            sampler,
+        }
+    }
 }
 
 pub struct TextureManager {
-    pub textures: Vec<Texture>,
-    pub samplers: Vec<vk::Sampler>,
+    textures: Vec<Texture>,
+    samplers: Vec<vk::Sampler>,
+    descriptor_set: vk::DescriptorSet,
 }
 
 impl TextureManager {
-    pub fn new() -> Self {
-        Self {
+    const DEFAULT_SAMPLER_NEAREST: SamplerId = 0;
+    const DEFAULT_SAMPLER_LINEAR: SamplerId = 1;
+    const DEFAULT_TEXTURE_WHITE: TextureId = 0;
+    const DEFAULT_TEXTURE_BLACK: TextureId = 1;
+    const DEFAULT_TEXTURE_CHECKERBOARD: TextureId = 2;
+
+
+    pub fn new(descriptor_set: vk::DescriptorSet, ctx: &mut SubmitContext) -> Self {
+        let mut manager = Self {
             textures: vec![],
             samplers: vec![],
-        }
-    }
+            descriptor_set,
+        };
 
-    pub fn add_texture(&mut self, texture: AllocatedImage) {
-        self.textures.push(Texture { image: texture });
-    }
-
-    pub fn destroy(self, device: &Device, allocator: &mut Allocator) {
-        for texture in self.textures {
-            texture.image.destroy(device, allocator);
-        }
-    }
-
-    pub fn init_defaults(
-        &mut self,
-        device: &Device,
-        allocator: &mut Allocator,
-        bindless_descriptor_set: vk::DescriptorSet,
-        deletion_queue: &mut DeletionQueue,
-    ) {
-        let white_img = AllocatedImage::new(
-            device,
-            allocator,
-            vk::Extent3D {
-                width: 1,
-                height: 1,
-                depth: 1,
-            },
-            vk::Format::R8G8B8A8_UNORM,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-            AllocUsage::GpuOnly,
-            vk::ImageAspectFlags::COLOR,
-            Some("White Image".into()),
-        );
-        let black_img = AllocatedImage::new(
-            device,
-            allocator,
-            vk::Extent3D {
-                width: 1,
-                height: 1,
-                depth: 1,
-            },
-            vk::Format::R8G8B8A8_UNORM,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-            AllocUsage::GpuOnly,
-            vk::ImageAspectFlags::COLOR,
-            Some("Black Image".into()),
-        );
-        let checkerboard_img = AllocatedImage::new(
-            device,
-            allocator,
-            vk::Extent3D {
-                width: 16,
-                height: 16,
-                depth: 1,
-            },
-            vk::Format::R8G8B8A8_UNORM,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-            AllocUsage::GpuOnly,
-            vk::ImageAspectFlags::COLOR,
-            Some("Checkerboard Image".into()),
-        );
         let sampler_info = vk::SamplerCreateInfo::default()
             .address_mode_u(vk::SamplerAddressMode::REPEAT)
             .address_mode_v(vk::SamplerAddressMode::REPEAT)
             .address_mode_w(vk::SamplerAddressMode::REPEAT)
             .mag_filter(vk::Filter::NEAREST)
             .min_filter(vk::Filter::NEAREST);
-        let sampler_nearest = unsafe { device.create_sampler(&sampler_info, None).unwrap() };
+        let sampler_nearest = unsafe { ctx.device.create_sampler(&sampler_info, None).unwrap() };
+        Self::add_sampler(&mut manager, sampler_nearest);
+
         let sampler_info = vk::SamplerCreateInfo::default()
             .address_mode_u(vk::SamplerAddressMode::REPEAT)
             .address_mode_v(vk::SamplerAddressMode::REPEAT)
             .address_mode_w(vk::SamplerAddressMode::REPEAT)
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR);
-        let sampler_linear = unsafe { device.create_sampler(&sampler_info, None).unwrap() };
+        let sampler_linear = unsafe { ctx.device.create_sampler(&sampler_info, None).unwrap() };
 
-        update_set(device, bindless_descriptor_set, &[
-            DescriptorImageWriteInfo {
-                binding: 2,
-                array_index: 0,
-                image_view: white_img.view,
-                sampler: sampler_nearest,
-                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            },
-            DescriptorImageWriteInfo {
-                binding: 2,
-                array_index: 1,
-                image_view: black_img.view,
-                sampler: sampler_nearest,
-                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            },
-            DescriptorImageWriteInfo {
-                binding: 2,
-                array_index: 2,
-                image_view: checkerboard_img.view,
-                sampler: sampler_nearest,
-                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            },
-        ], &[]);
+        Self::add_sampler(&mut manager, sampler_linear);
 
-        self.textures.push(Texture { image: white_img });
-        self.textures.push(Texture { image: black_img });
-        self.textures.push(Texture { image: checkerboard_img });
-        self.samplers.push(sampler_nearest);
-        self.samplers.push(sampler_linear);
-        deletion_queue.push(move |device| {
-            unsafe {
-                device.destroy_sampler(sampler_nearest, None);
-                device.destroy_sampler(sampler_linear, None);
+        let white = [255u8, 255, 255, 255];
+        let black = [0u8, 0, 0, 255];
+        let magenta = [255u8, 0, 255, 255];
+        let pixels: [[u8; 4]; 16 * 16] = core::array::from_fn(|i|
+            // create a checkerboard pattern of white and magenta
+            if (i / 16 + i % 16) % 2 == 0 {
+                white
+            } else {
+                magenta
             }
-        });
+        );
+        let pixel_data = pixels.iter().flat_map(|p| p.iter().copied()).collect::<Vec<_>>();
+
+        Self::add_texture(&mut manager,
+                          Texture::new(
+                              Self::DEFAULT_SAMPLER_NEAREST,
+                              ctx,
+                              Some("White".into()),
+                              &white,
+                          vk::Extent3D { width: 1, height: 1, depth: 1 }),
+                          &ctx.device,
+                          false,
+        );
+        let cleanup1 = ctx.cleanup.take().unwrap();
+        Self::add_texture(&mut manager,
+                          Texture::new(
+                              Self::DEFAULT_SAMPLER_NEAREST,
+                              ctx,
+                              Some("Black".into()),
+                              &black,
+                              vk::Extent3D { width: 1, height: 1, depth: 1 }),
+                          &ctx.device,
+                          false,
+        );
+        let cleanup2 = ctx.cleanup.take().unwrap();
+        Self::add_texture(&mut manager,
+                          Texture::new(
+                              Self::DEFAULT_SAMPLER_NEAREST,
+                              ctx,
+                              Some("Checkerboard".into()),
+                              &pixel_data,
+                              vk::Extent3D { width: 16, height: 16, depth: 1 }),
+                          &ctx.device,
+                          true,
+        );
+        let cleanup3 = ctx.cleanup.take().unwrap();
+        
+        ctx.cleanup = Some(Box::from(move |device: &Device, allocator: &mut Allocator| {
+            cleanup1(device, allocator);
+            cleanup2(device, allocator);
+            cleanup3(device, allocator);
+        }));
+
+        manager
+    }
+    pub fn descriptor_set(&self) -> vk::DescriptorSet {
+        self.descriptor_set
+    }
+
+    pub fn add_texture(&mut self, mut texture: Texture, device: &Device, update_set: bool) {
+        texture.id = self.textures.len();
+        self.textures.push(texture);
+        if update_set {
+            self.update_set(device);
+        }
+    }
+
+    pub fn add_sampler(&mut self, sampler: vk::Sampler) {
+        self.samplers.push(sampler);
+    }
+
+    pub fn update_set(&self, device: &Device) {
+        debug!("Updating texture descriptor set with textures: {:#?}", self.textures);
+        update_set(device, self.descriptor_set,
+                   &self.textures.iter().map(|texture| DescriptorImageWriteInfo {
+                       binding: 2,
+                       array_index: texture.id as u32,
+                       image_view: texture.image.view,
+                       sampler: self.samplers[texture.sampler],
+                       layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                       ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                   }).collect::<Vec<_>>(), &[]);
+    }
+    
+    pub fn destroy(&mut self, device: &Device, allocator: &mut Allocator) {
+        for texture in self.textures.drain(..) {
+            texture.image.destroy(device, allocator);
+        }
+        for sampler in self.samplers.drain(..) {
+            unsafe {
+                device.destroy_sampler(sampler, None);
+            }
+        }
     }
 }

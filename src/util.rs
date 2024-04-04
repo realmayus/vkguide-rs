@@ -1,4 +1,4 @@
-use crate::resources::{AllocatedBuffer, Allocator, DescriptorAllocator};
+use crate::resources::{AllocatedBuffer, DescriptorAllocator};
 use ash::{vk, Device};
 use glam::{Mat4, Vec4};
 use std::error::Error;
@@ -69,7 +69,7 @@ pub mod device_discovery {
     use ash::{vk, Instance, khr};
     use log::info;
     use std::ffi::CStr;
-    use ash::khr::surface;
+    
 
     pub(crate) fn pick_physical_device(instance: &Instance, surface: &khr::surface::Instance, surface_khr: vk::SurfaceKHR) -> vk::PhysicalDevice {
         let devices = unsafe { instance.enumerate_physical_devices().unwrap() };

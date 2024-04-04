@@ -1,6 +1,6 @@
 use crate::pipeline::PipelineBuilder;
 use crate::util::{load_shader_module, DeletionQueue};
-use crate::Mesh;
+use crate::scene::mesh::Mesh;
 use ash::{vk, Device};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
@@ -140,7 +140,7 @@ impl MeshPipeline {
             for mesh in meshes {
                 let push_constants = PushConstants {
                     world_matrix: world.to_cols_array_2d(),
-                    vertex_buffer: mesh.mem.as_ref().unwrap().vertex_address,
+                    vertex_buffer: mesh.vertex_buffer_address(),
                 };
                 device.cmd_push_constants(
                     cmd,
@@ -149,7 +149,7 @@ impl MeshPipeline {
                     0,
                     bytemuck::cast_slice(&[push_constants]),
                 );
-                device.cmd_bind_index_buffer(cmd, mesh.mem.as_ref().unwrap().index_buffer.buffer, 0, vk::IndexType::UINT32);
+                device.cmd_bind_index_buffer(cmd, mesh.index_buffer(), 0, vk::IndexType::UINT32);
                 device.cmd_draw_indexed(cmd, mesh.indices.len() as u32, 1, 0, 0, 0);
             }
             device.cmd_end_rendering(cmd);

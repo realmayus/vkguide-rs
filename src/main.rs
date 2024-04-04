@@ -5,17 +5,18 @@ mod pipeline;
 mod resources;
 mod util;
 mod ui;
+mod scene;
 
 use std::cell::RefCell;
 use crate::resources::{AllocUsage, AllocatedBuffer, AllocatedImage, Allocator, DescriptorAllocator, PoolSizeRatio, TextureManager, DescriptorImageWriteInfo, update_set, DescriptorBufferWriteInfo};
 use crate::util::{device_discovery, DeletionQueue, DescriptorLayoutBuilder, GpuSceneData};
-use ash::vk::{DescriptorSet, DescriptorSetLayout, DeviceMemory, Sampler};
+use ash::vk::{DescriptorSet, DescriptorSetLayout};
 use ash::{vk, Device, Instance, khr};
-use glam::{Vec2, Vec3};
+use glam::{Vec3};
 use gpu_alloc::GpuAllocator;
 use gpu_alloc_ash::{device_properties, AshMemoryDevice};
 use log::{debug, info};
-use raw_window_handle::{HasDisplayHandle, HasRawDisplayHandle, HasRawWindowHandle, HasWindowHandle};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::error::Error;
 use std::path::Path;
 use std::rc::Rc;
@@ -29,7 +30,8 @@ use winit::{
 };
 
 use crate::pipeline::mesh::MeshPipeline;
-use crate::pipeline::Vertex;
+
+use crate::scene::mesh::Mesh;
 
 const FRAME_OVERLAP: usize = 2;
 
@@ -63,30 +65,7 @@ struct App {
     meshes: Vec<Mesh>,
     scene_data: GpuSceneData,
     scene_data_layout: vk::DescriptorSetLayout,
-    images: Vec<AllocatedImage>,
-    samplers: Vec<vk::Sampler>,
-    bindless_descriptor_set: vk::DescriptorSet,
     texture_manager: TextureManager,
-}
-
-#[derive(Default)]
-pub struct Model {
-    pub meshes: Vec<Mesh>,
-    pub children: Vec<Model>,
-}
-
-pub struct GpuMesh {
-    index_buffer: AllocatedBuffer,
-    vertex_buffer: AllocatedBuffer,
-    vertex_address: vk::DeviceAddress,
-}
-
-pub struct Mesh {
-    pub(crate) mem: Option<GpuMesh>,
-    pub(crate) vertices: Vec<Vec3>,
-    pub(crate) indices: Vec<u32>,
-    pub(crate) normals: Vec<Vec3>,
-    pub(crate) uvs: Vec<Vec2>,
 }
 
 struct SubmitContext {
@@ -98,7 +77,7 @@ struct SubmitContext {
     cleanup: Option<Box<dyn FnOnce(&Device, &mut Allocator)>>,
 }
 
-type ImmediateSubmitFn<'a> = Box<(dyn FnOnce(&mut SubmitContext) + 'a)>;
+type ImmediateSubmitFn<'a, T> = Box<(dyn FnOnce(&mut SubmitContext) -> T + 'a)>;
 
 impl SubmitContext {
     fn new(app: &App) -> Self {
@@ -112,7 +91,7 @@ impl SubmitContext {
         }
     }
 
-    fn immediate_submit(&mut self, mut cmd: ImmediateSubmitFn) {
+    fn immediate_submit<T>(&mut self, cmd: ImmediateSubmitFn<T>) -> T {
         let cmd_buffer = self.cmd_buffer;
         unsafe {
             self.device.reset_fences(&[self.fence]).unwrap();
@@ -121,7 +100,7 @@ impl SubmitContext {
                 .unwrap();
             let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.device.begin_command_buffer(cmd_buffer, &begin_info).unwrap();
-            cmd(self);
+            let res = cmd(self);
             self.device.end_command_buffer(cmd_buffer).unwrap();
             let cmd_buffer_submit = vk::CommandBufferSubmitInfo::default().command_buffer(cmd_buffer);
             let cmd_buffer_submits = [cmd_buffer_submit];
@@ -134,103 +113,11 @@ impl SubmitContext {
             if self.cleanup.is_some() {
                 self.cleanup.take().unwrap()(&self.device, &mut self.allocator.borrow_mut());
             }
+            res
         }
     }
 }
 
-impl Mesh {
-    fn upload(&mut self, ctx: &mut SubmitContext) {
-        info!("Uploading mesh to GPU");
-        debug!("Mesh vertices: {:?}", self.vertices);
-
-        let vertices = self
-            .vertices
-            .iter()
-            .zip(self.normals.iter())
-            .zip(self.uvs.iter())
-            .map(|((vertex, normal), uv)| Vertex {
-                position: vertex.to_array(),
-                normal: normal.to_array(),
-                uv_x: uv.x,
-                uv_y: uv.y,
-                color: [0.4, 0.6, 0.3, 1.0],
-            })
-            .collect::<Vec<_>>();
-
-        let vertex_buffer_size = (vertices.len() * std::mem::size_of::<Vertex>()) as vk::DeviceSize;
-        let index_buffer_size = (self.indices.len() * std::mem::size_of::<u32>()) as vk::DeviceSize;
-        let vertex_buffer = AllocatedBuffer::new(
-            &ctx.device,
-            &mut ctx.allocator.borrow_mut(),
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-            AllocUsage::GpuOnly,
-            vertex_buffer_size,
-            Some("Vertex Buffer".into()),
-        );
-        let device_address_info = vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer);
-        let buffer_device_address = unsafe { ctx.device.get_buffer_device_address(&device_address_info) };
-        let index_buffer = AllocatedBuffer::new(
-            &ctx.device,
-            &mut ctx.allocator.borrow_mut(),
-            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            AllocUsage::GpuOnly,
-            index_buffer_size,
-            Some("Index Buffer".into()),
-        );
-
-        let mut staging = AllocatedBuffer::new(
-            &ctx.device,
-            &mut ctx.allocator.borrow_mut(),
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            AllocUsage::Shared,
-            vertex_buffer_size + index_buffer_size,
-            Some("Staging Buffer".into()),
-        );
-
-        let map = unsafe {
-            staging
-                .allocation
-                .map(AshMemoryDevice::wrap(&ctx.device), 0, staging.size as usize)
-                .unwrap()
-        };
-        // copy vertex buffer
-        let vertex_buffer_ptr = map.as_ptr() as *mut Vertex;
-        unsafe {
-            vertex_buffer_ptr.copy_from_nonoverlapping(vertices.as_ptr(), vertices.len());
-            let index_buffer_ptr = vertex_buffer_ptr.add(vertices.len()) as *mut u32;
-            index_buffer_ptr.copy_from_nonoverlapping(self.indices.as_ptr(), self.indices.len());
-        };
-
-        let vertex_copy = vk::BufferCopy {
-            src_offset: 0,
-            dst_offset: 0,
-            size: vertex_buffer_size,
-        };
-        unsafe {
-            ctx.device
-                .cmd_copy_buffer(ctx.cmd_buffer, staging.buffer, vertex_buffer.buffer, &[vertex_copy]);
-        };
-        let index_copy = vk::BufferCopy {
-            src_offset: vertex_buffer_size,
-            dst_offset: 0,
-            size: index_buffer_size,
-        };
-        unsafe {
-            ctx.device.cmd_copy_buffer(ctx.cmd_buffer, staging.buffer, index_buffer.buffer, &[index_copy]);
-        };
-        // return empty FnOnce closure
-
-        self.mem = Some(GpuMesh {
-            vertex_buffer,
-            vertex_address: buffer_device_address,
-            index_buffer,
-        });
-
-        ctx.cleanup = Some(Box::from(move |device: &Device, allocator: &mut Allocator| {
-            staging.destroy(device, allocator);
-        }));
-    }
-}
 
 pub const SWAPCHAIN_IMAGE_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
@@ -277,14 +164,25 @@ impl App {
             Self::init_descriptors(&device, draw_image.view, &mut deletion_queue);
         let (bindless_descriptor_set, bindless_set_layout) = Self::init_bindless(&device);
         let mesh_pipeline = MeshPipeline::new(&device, window_size, &mut deletion_queue, bindless_set_layout);
-
+        
+        let device = Rc::new(device);
+        let allocator= Rc::new(RefCell::new(allocator));
+        
+        let texture_manager = SubmitContext {
+            device: device.clone(),
+            allocator: allocator.clone(),
+            fence: immediate_fence,
+            cmd_buffer: immediate_command_buffer,
+            queue: graphics_queue.0,
+            cleanup: None,
+        }.immediate_submit(Box::new(|ctx| TextureManager::new(bindless_descriptor_set, ctx)));
         Ok(App {
             entry,
             instance,
             surface: surface_khr,
             surface_fn: surface,
             physical_device,
-            device: Rc::new(device),
+            device,
             graphics_queue,
             present_queue,
             swapchain: (swapchain, swapchain_khr),
@@ -294,7 +192,7 @@ impl App {
             current_frame: 0,
             window,
             window_size,
-            allocator: Rc::new(RefCell::new(allocator)),
+            allocator,
             main_deletion_queue: deletion_queue,
             draw_image: Some(draw_image), // must be present at all times, Option<_> because we need ownership when destroying
             depth_image: Some(depth_image),
@@ -315,10 +213,7 @@ impl App {
                 sun_dir: Default::default(),
                 sun_color: Default::default(),
             },
-            images: vec![],
-            samplers: vec![],
-            bindless_descriptor_set,
-            texture_manager: TextureManager::new(),
+            texture_manager,
         })
     }
 
@@ -421,7 +316,7 @@ impl App {
 
             ..Default::default()
         };
-        let swapchain = swapchain::Device::new(instance, &device);
+        let swapchain = swapchain::Device::new(instance, device);
         let swapchain_khr = unsafe { swapchain.create_swapchain(&create_info, None).unwrap() };
 
         let images = unsafe { swapchain.get_swapchain_images(swapchain_khr).unwrap() };
@@ -655,7 +550,7 @@ impl App {
         }];
         let mut descriptor_pool = DescriptorAllocator::new(device, 1, &sizes);
         let builder = DescriptorLayoutBuilder::default().add_binding(0, vk::DescriptorType::STORAGE_IMAGE, vk::ShaderStageFlags::COMPUTE);
-        let layout = builder.build(&device);
+        let layout = builder.build(device);
         let descriptor_set = descriptor_pool.allocate(device, layout);
 
         update_set(device, descriptor_set, &[
@@ -721,134 +616,9 @@ impl App {
         self.depth_image = Some(depth_image);
     }
 
-    fn upload_mesh(&mut self, mesh: &Mesh) -> GpuMesh {
-        info!("Uploading mesh to GPU");
-        debug!("Mesh vertices: {:?}", mesh.vertices);
-        let vertices = mesh
-            .vertices
-            .iter()
-            .zip(mesh.normals.iter())
-            .zip(mesh.uvs.iter())
-            .map(|((vertex, normal), uv)| Vertex {
-                position: vertex.to_array(),
-                normal: normal.to_array(),
-                uv_x: uv.x,
-                uv_y: uv.y,
-                color: [0.4, 0.6, 0.3, 1.0],
-            })
-            .collect::<Vec<_>>();
-
-        let vertex_buffer_size = (vertices.len() * std::mem::size_of::<Vertex>()) as vk::DeviceSize;
-        let index_buffer_size = (mesh.indices.len() * std::mem::size_of::<u32>()) as vk::DeviceSize;
-        let vertex_buffer = AllocatedBuffer::new(
-            &self.device,
-            &mut self.allocator.borrow_mut(),
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-            AllocUsage::GpuOnly,
-            vertex_buffer_size,
-            Some("Vertex Buffer".into()),
-        );
-        let device_address_info = vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer);
-        let buffer_device_address = unsafe { self.device.get_buffer_device_address(&device_address_info) };
-        let index_buffer = AllocatedBuffer::new(
-            &self.device,
-            &mut self.allocator.borrow_mut(),
-            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            AllocUsage::GpuOnly,
-            index_buffer_size,
-            Some("Index Buffer".into()),
-        );
-
-        let mut staging = AllocatedBuffer::new(
-            &self.device,
-            &mut self.allocator.borrow_mut(),
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            AllocUsage::Shared,
-            vertex_buffer_size + index_buffer_size,
-            Some("Staging Buffer".into()),
-        );
-
-        let map = unsafe {
-            staging
-                .allocation
-                .map(AshMemoryDevice::wrap(&self.device), 0, staging.size as usize)
-                .unwrap()
-        };
-        // copy vertex buffer
-        let vertex_buffer_ptr = map.as_ptr() as *mut Vertex;
-        unsafe {
-            vertex_buffer_ptr.copy_from_nonoverlapping(vertices.as_ptr(), vertices.len());
-            let index_buffer_ptr = vertex_buffer_ptr.add(vertices.len()) as *mut u32;
-            index_buffer_ptr.copy_from_nonoverlapping(mesh.indices.as_ptr(), mesh.indices.len());
-        };
-        let mut submit_ctx = SubmitContext::new(self);
-        submit_ctx.immediate_submit(Box::new(|ctx| {
-            let vertex_copy = vk::BufferCopy {
-                src_offset: 0,
-                dst_offset: 0,
-                size: vertex_buffer_size,
-            };
-            unsafe {
-                ctx.device
-                    .cmd_copy_buffer(ctx.cmd_buffer, staging.buffer, vertex_buffer.buffer, &[vertex_copy]);
-            };
-            let index_copy = vk::BufferCopy {
-                src_offset: vertex_buffer_size,
-                dst_offset: 0,
-                size: index_buffer_size,
-            };
-            unsafe {
-                ctx.device.cmd_copy_buffer(ctx.cmd_buffer, staging.buffer, index_buffer.buffer, &[index_copy]);
-            };
-            ctx.cleanup = Some(Box::from(|device: &Device, allocator: &mut Allocator| {
-                staging.destroy(device, allocator);
-            }));
-        }));
-
-        GpuMesh {
-            vertex_buffer,
-            vertex_address: buffer_device_address,
-            index_buffer,
-        }
-    }
-
     // https://i.imgflip.com/8l3uzz.jpg
     fn current_frame(&self) -> &FrameData {
         &self.frames[(self.current_frame % FRAME_OVERLAP as u32) as usize]
-    }
-
-    fn init_textures(&mut self) {
-        self.texture_manager.init_defaults(
-            &self.device,
-            &mut self.allocator.borrow_mut(),
-            self.bindless_descriptor_set,
-            &mut self.main_deletion_queue,
-        );
-        let white = [255u8, 255, 255, 255];
-        let black = [0u8, 0, 0, 255];
-        let magenta = [255u8, 0, 255, 255];
-        let pixels: [[u8; 4]; 16 * 16] = core::array::from_fn(|i|
-            // create a checkerboard pattern of white and magenta
-            if (i / 16 + i % 16) % 2 == 0 {
-                white
-            } else {
-                magenta
-            }
-        );
-        let pixel_data = pixels.iter().flat_map(|p| p.iter().copied()).collect::<Vec<_>>();
-
-        SubmitContext::new(self).immediate_submit(Box::new(|ctx| self.texture_manager.textures[0]
-            .image
-            .write(&white, ctx)));
-
-        SubmitContext::new(self).immediate_submit(Box::new(|ctx| self.texture_manager.textures[1]
-            .image
-            .write(&black, ctx)));
-
-
-        SubmitContext::new(self).immediate_submit(Box::new(|ctx| self.texture_manager.textures[2]
-            .image
-            .write(&pixel_data, ctx)));
     }
 
     fn draw(&mut self) {
@@ -948,7 +718,7 @@ impl App {
                 &self.meshes,
                 self.draw_image.as_ref().unwrap().view,
                 self.depth_image.as_ref().unwrap().view,
-                self.bindless_descriptor_set,
+                self.texture_manager.descriptor_set(),
             );
 
             // prepare copying of the draw image to the swapchain image
@@ -1053,19 +823,12 @@ impl Drop for App {
             self.main_deletion_queue.flush(&self.device);
             self.descriptor_allocator.destroy_pools(&self.device);
             for mesh in self.meshes.drain(..) {
-                let mem = mesh.mem.unwrap();
-                mem.index_buffer.destroy(&self.device, &mut self.allocator.borrow_mut());
-                mem.vertex_buffer.destroy(&self.device, &mut self.allocator.borrow_mut());
+                mesh.destroy(&self.device, &mut self.allocator.borrow_mut());
             }
 
             self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator.borrow_mut());
             self.depth_image.take().unwrap().destroy(&self.device, &mut self.allocator.borrow_mut());
-            for image in self.images.drain(..) {
-                image.destroy(&self.device, &mut self.allocator.borrow_mut());
-            }
-            for sampler in self.samplers.drain(..) {
-                self.device.destroy_sampler(sampler, None);
-            }
+            self.texture_manager.destroy(&self.device, &mut self.allocator.borrow_mut());
             for frame in self.frames.iter_mut() {
                 frame.deletion_queue.flush(&self.device); // take care of frames that were prepared but not reached in the render loop yet
                 for buffer in frame.stale_buffers.drain(..) {
@@ -1096,12 +859,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     info!("Loaded gltf with {} meshes", meshes.len());
 
     for mut mesh in meshes {
-        let mut submit_ctx = SubmitContext::new(&mut app);
+        let mut submit_ctx = SubmitContext::new(&app);
         submit_ctx.immediate_submit(Box::new(|ctx| mesh.upload(ctx)));
 
         app.meshes.push(mesh);
     }
-    app.init_textures();
 
     Ok(event_loop.unwrap().run(move |event, target| match event {
         Event::WindowEvent {

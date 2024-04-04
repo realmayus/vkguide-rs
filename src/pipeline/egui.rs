@@ -1,6 +1,6 @@
 use crate::pipeline::PipelineBuilder;
 use crate::util::{load_shader_module, DeletionQueue};
-use crate::Mesh;
+use crate::scene::mesh::Mesh;
 use ash::{vk, Device};
 use bytemuck::{Pod, Zeroable};
 use egui::epaint::{ImageDelta, Primitive};
@@ -157,7 +157,7 @@ impl EguiPipeline {
             })
             .layer_count(1)
             .view_mask(0);
-        for egui::ClippedPrimitive { clip_rect, primitive} in &clipped_meshes {
+        for egui::ClippedPrimitive { clip_rect: _, primitive} in &clipped_meshes {
             let mesh = match primitive {
                 Primitive::Mesh(mesh) => mesh,
                 Primitive::Callback(_) => unimplemented!()
@@ -165,7 +165,7 @@ impl EguiPipeline {
             if mesh.vertices.is_empty() || mesh.indices.is_empty() {
                 continue;
             }
-            if let egui::TextureId::Managed(id) = mesh.texture_id {
+            if let egui::TextureId::Managed(_id) = mesh.texture_id {
                 // todo bind texture with id `id`
             } else {
                 todo!("user textures not supported yet")
@@ -173,7 +173,7 @@ impl EguiPipeline {
         }
         let mut vertex_offset = 0;
         let mut index_offset = 0;
-        for egui::ClippedPrimitive { clip_rect, primitive} in &clipped_meshes {
+        for egui::ClippedPrimitive { clip_rect: _, primitive} in &clipped_meshes {
             let emesh = match primitive {
                 Primitive::Mesh(mesh) => mesh,
                 Primitive::Callback(_) => unimplemented!()
@@ -202,7 +202,7 @@ impl EguiPipeline {
                 device.cmd_set_scissor(cmd, 0, &[self.scissor]);
                 let push_constants = PushConstants {
                     screen_size: [self.window_size.0 as f32, self.window_size.1 as f32],
-                    vertex_buffer: self.mesh.mem.as_ref().unwrap().vertex_address,
+                    vertex_buffer: self.mesh.vertex_buffer_address(),
                     font_texture_id: 0,
                     padding: 0,
                 };
@@ -214,7 +214,7 @@ impl EguiPipeline {
                     0,
                     bytemuck::cast_slice(&[push_constants]),
                 );
-                device.cmd_bind_index_buffer(cmd, self.mesh.mem.as_ref().unwrap().index_buffer.buffer, 0, vk::IndexType::UINT32);
+                device.cmd_bind_index_buffer(cmd, self.mesh.index_buffer(), 0, vk::IndexType::UINT32);
                 device.cmd_draw_indexed(cmd, self.mesh.indices.len() as u32, 1, 0, 0, 0);
 
                 device.cmd_end_rendering(cmd);
@@ -227,5 +227,5 @@ impl EguiPipeline {
         self.egui_winit.handle_platform_output(window, output.platform_output.clone());
     }
 
-    fn update_texture(&mut self, texture_id: TextureId, delta: ImageDelta) {}
+    fn update_texture(&mut self, _texture_id: TextureId, _delta: ImageDelta) {}
 }

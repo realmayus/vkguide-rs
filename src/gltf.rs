@@ -1,6 +1,7 @@
-use crate::{Mesh, Model};
 use glam::{Vec2, Vec3};
 use std::path::Path;
+use crate::scene::mesh::Mesh;
+use crate::scene::model::Model;
 
 pub fn load_gltf(path: &Path) -> Vec<Model> {
     let (gltf, buffers, _) = gltf::import(path).unwrap();
