@@ -1,5 +1,5 @@
+pub mod egui;
 pub mod mesh;
-mod egui;
 
 use crate::{DEPTH_FORMAT, SWAPCHAIN_IMAGE_FORMAT};
 use ash::{vk, Device};

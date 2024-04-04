@@ -1,5 +1,6 @@
-use crate::util::{transition_image};
-use crate::{SubmitContext};
+use crate::util::transition_image;
+use crate::SubmitContext;
+use std::mem;
 
 use ash::vk::{DeviceMemory, DeviceSize};
 use ash::{vk, Device};
@@ -126,13 +127,23 @@ pub struct DescriptorImageWriteInfo {
     pub ty: vk::DescriptorType,
 }
 
-pub fn update_set(device: &Device, set: vk::DescriptorSet, image_writes: &[DescriptorImageWriteInfo], buffer_writes: &[DescriptorBufferWriteInfo]) {
+pub fn update_set(
+    device: &Device,
+    set: vk::DescriptorSet,
+    image_writes: &[DescriptorImageWriteInfo],
+    buffer_writes: &[DescriptorBufferWriteInfo],
+) {
     let mut writes = vec![];
-    let buffer_infos = buffer_writes.iter().map(|write| [vk::DescriptorBufferInfo {
-        buffer: write.buffer,
-        offset: write.offset,
-        range: write.size,
-    }]).collect::<Vec<_>>();
+    let buffer_infos = buffer_writes
+        .iter()
+        .map(|write| {
+            [vk::DescriptorBufferInfo {
+                buffer: write.buffer,
+                offset: write.offset,
+                range: write.size,
+            }]
+        })
+        .collect::<Vec<_>>();
     for (i, write) in buffer_writes.iter().enumerate() {
         writes.push(
             vk::WriteDescriptorSet::default()
@@ -140,14 +151,19 @@ pub fn update_set(device: &Device, set: vk::DescriptorSet, image_writes: &[Descr
                 .dst_set(set)
                 .dst_array_element(write.array_index)
                 .descriptor_type(write.ty)
-                .buffer_info(&buffer_infos[i])
+                .buffer_info(&buffer_infos[i]),
         );
     }
-    let image_infos = image_writes.iter().map(|write| [vk::DescriptorImageInfo {
-        image_view: write.image_view,
-        sampler: write.sampler,
-        image_layout: write.layout,
-    }]).collect::<Vec<_>>();
+    let image_infos = image_writes
+        .iter()
+        .map(|write| {
+            [vk::DescriptorImageInfo {
+                image_view: write.image_view,
+                sampler: write.sampler,
+                image_layout: write.layout,
+            }]
+        })
+        .collect::<Vec<_>>();
     for (i, write) in image_writes.iter().enumerate() {
         writes.push(
             vk::WriteDescriptorSet::default()
@@ -155,7 +171,7 @@ pub fn update_set(device: &Device, set: vk::DescriptorSet, image_writes: &[Descr
                 .dst_set(set)
                 .dst_array_element(write.array_index)
                 .descriptor_type(write.ty)
-                .image_info(&image_infos[i])
+                .image_info(&image_infos[i]),
         );
     }
 
@@ -281,6 +297,7 @@ impl AllocatedImage {
             .format(format)
             .extent(extent)
             .mip_levels(1)
+            .flags(vk::ImageCreateFlags::empty())
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
@@ -290,7 +307,6 @@ impl AllocatedImage {
         let reqs = unsafe { device.get_image_memory_requirements(image) };
         let allocation = unsafe {
             allocator
-
                 .alloc(
                     AshMemoryDevice::wrap(device),
                     gpu_alloc::Request {
@@ -424,7 +440,7 @@ pub type TextureId = usize;
 pub struct Texture {
     pub id: TextureId,
     pub image: AllocatedImage,
-    sampler: SamplerId,  // rust doesn't like self-referential structs (samplers also live in TextureManager)
+    sampler: SamplerId, // rust doesn't like self-referential structs (samplers also live in TextureManager)
 }
 
 impl Texture {
@@ -433,7 +449,7 @@ impl Texture {
             &ctx.device,
             &mut ctx.allocator.borrow_mut(),
             extent,
-            vk::Format::R8G8B8A8_UNORM,
+            vk::Format::R8G8B8A8_SRGB,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
             AllocUsage::GpuOnly,
             vk::ImageAspectFlags::COLOR,
@@ -448,6 +464,25 @@ impl Texture {
             sampler,
         }
     }
+
+    pub fn replace_image(&mut self, ctx: &mut SubmitContext, label: Option<String>, data: &[u8], extent: vk::Extent3D) {
+        let img = AllocatedImage::new(
+            &ctx.device,
+            &mut ctx.allocator.borrow_mut(),
+            extent,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            AllocUsage::GpuOnly,
+            vk::ImageAspectFlags::COLOR,
+            label,
+        );
+
+        img.write(data, ctx);
+
+        let old = mem::replace(&mut self.image, img);
+
+        old.destroy(&ctx.device, &mut ctx.allocator.borrow_mut());
+    }
 }
 
 pub struct TextureManager {
@@ -457,12 +492,11 @@ pub struct TextureManager {
 }
 
 impl TextureManager {
-    const DEFAULT_SAMPLER_NEAREST: SamplerId = 0;
-    const DEFAULT_SAMPLER_LINEAR: SamplerId = 1;
-    const DEFAULT_TEXTURE_WHITE: TextureId = 0;
-    const DEFAULT_TEXTURE_BLACK: TextureId = 1;
-    const DEFAULT_TEXTURE_CHECKERBOARD: TextureId = 2;
-
+    pub const DEFAULT_SAMPLER_NEAREST: SamplerId = 0;
+    pub const DEFAULT_SAMPLER_LINEAR: SamplerId = 1;
+    pub const DEFAULT_TEXTURE_WHITE: TextureId = 0;
+    pub const DEFAULT_TEXTURE_BLACK: TextureId = 1;
+    pub const DEFAULT_TEXTURE_CHECKERBOARD: TextureId = 2;
 
     pub fn new(descriptor_set: vk::DescriptorSet, ctx: &mut SubmitContext) -> Self {
         let mut manager = Self {
@@ -503,40 +537,58 @@ impl TextureManager {
         );
         let pixel_data = pixels.iter().flat_map(|p| p.iter().copied()).collect::<Vec<_>>();
 
-        Self::add_texture(&mut manager,
-                          Texture::new(
-                              Self::DEFAULT_SAMPLER_NEAREST,
-                              ctx,
-                              Some("White".into()),
-                              &white,
-                          vk::Extent3D { width: 1, height: 1, depth: 1 }),
-                          &ctx.device,
-                          false,
+        Self::add_texture(
+            &mut manager,
+            Texture::new(
+                Self::DEFAULT_SAMPLER_NEAREST,
+                ctx,
+                Some("White".into()),
+                &white,
+                vk::Extent3D {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            ),
+            &ctx.device,
+            false,
         );
         let cleanup1 = ctx.cleanup.take().unwrap();
-        Self::add_texture(&mut manager,
-                          Texture::new(
-                              Self::DEFAULT_SAMPLER_NEAREST,
-                              ctx,
-                              Some("Black".into()),
-                              &black,
-                              vk::Extent3D { width: 1, height: 1, depth: 1 }),
-                          &ctx.device,
-                          false,
+        Self::add_texture(
+            &mut manager,
+            Texture::new(
+                Self::DEFAULT_SAMPLER_NEAREST,
+                ctx,
+                Some("Black".into()),
+                &black,
+                vk::Extent3D {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            ),
+            &ctx.device,
+            false,
         );
         let cleanup2 = ctx.cleanup.take().unwrap();
-        Self::add_texture(&mut manager,
-                          Texture::new(
-                              Self::DEFAULT_SAMPLER_NEAREST,
-                              ctx,
-                              Some("Checkerboard".into()),
-                              &pixel_data,
-                              vk::Extent3D { width: 16, height: 16, depth: 1 }),
-                          &ctx.device,
-                          true,
+        Self::add_texture(
+            &mut manager,
+            Texture::new(
+                Self::DEFAULT_SAMPLER_NEAREST,
+                ctx,
+                Some("Checkerboard".into()),
+                &pixel_data,
+                vk::Extent3D {
+                    width: 16,
+                    height: 16,
+                    depth: 1,
+                },
+            ),
+            &ctx.device,
+            true,
         );
         let cleanup3 = ctx.cleanup.take().unwrap();
-        
+
         ctx.cleanup = Some(Box::from(move |device: &Device, allocator: &mut Allocator| {
             cleanup1(device, allocator);
             cleanup2(device, allocator);
@@ -562,18 +614,29 @@ impl TextureManager {
     }
 
     pub fn update_set(&self, device: &Device) {
-        debug!("Updating texture descriptor set with textures: {:#?}", self.textures);
-        update_set(device, self.descriptor_set,
-                   &self.textures.iter().map(|texture| DescriptorImageWriteInfo {
-                       binding: 2,
-                       array_index: texture.id as u32,
-                       image_view: texture.image.view,
-                       sampler: self.samplers[texture.sampler],
-                       layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                       ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                   }).collect::<Vec<_>>(), &[]);
+        update_set(
+            device,
+            self.descriptor_set,
+            &self
+                .textures
+                .iter()
+                .map(|texture| DescriptorImageWriteInfo {
+                    binding: 2,
+                    array_index: texture.id as u32,
+                    image_view: texture.image.view,
+                    sampler: self.samplers[texture.sampler],
+                    layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                })
+                .collect::<Vec<_>>(),
+            &[],
+        );
     }
-    
+
+    pub fn texture_mut(&mut self, id: TextureId) -> &mut Texture {
+        &mut self.textures[id]
+    }
+
     pub fn destroy(&mut self, device: &Device, allocator: &mut Allocator) {
         for texture in self.textures.drain(..) {
             texture.image.destroy(device, allocator);

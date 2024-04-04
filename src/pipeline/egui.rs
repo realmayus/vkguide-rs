@@ -1,12 +1,19 @@
 use crate::pipeline::PipelineBuilder;
-use crate::util::{load_shader_module, DeletionQueue};
+use crate::resources::{AllocUsage, AllocatedBuffer, Allocator, Texture, TextureId, TextureManager};
 use crate::scene::mesh::Mesh;
+use crate::util::{encode_4_u8_as_3_f32, load_shader_module, DeletionQueue};
+use crate::{SubmitContext, FRAME_OVERLAP};
 use ash::{vk, Device};
 use bytemuck::{Pod, Zeroable};
+use egui::ahash::{HashMap, HashMapExt};
 use egui::epaint::{ImageDelta, Primitive};
-use egui::{Context, TextureId, TexturesDelta};
+use egui::{Context, FullOutput, ImageData, TexturesDelta};
+use glam::{Vec2, Vec3};
+use log::debug;
 use std::ffi::CStr;
 use winit::window::Window;
+
+type EguiTextureId = egui::TextureId;
 
 pub struct EguiPipeline {
     viewport: vk::Viewport,
@@ -14,9 +21,12 @@ pub struct EguiPipeline {
     pipeline: vk::Pipeline,
     pub layout: vk::PipelineLayout,
     window_size: (u32, u32),
-    pub mesh: Mesh,
     context: Context,
     egui_winit: egui_winit::State,
+    textures: HashMap<EguiTextureId, TextureId>,
+    mesh_buffers: Vec<(AllocatedBuffer, AllocatedBuffer)>, // Vertex buffer, index buffer
+    bindless_set_layout: vk::DescriptorSetLayout,
+    raw_input: egui::RawInput,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Debug)]
@@ -27,13 +37,26 @@ struct PushConstants {
     padding: u32,
 }
 
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone, Debug)]
+struct Vertex {
+    pos: [f32; 2],
+    uv: [f32; 2],
+    color: u32,
+    padding: u32,
+}
+
 impl EguiPipeline {
+    const INDEX_BUFFER_SIZE: usize = 1024 * 1024;
+    const VERTEX_BUFFER_SIZE: usize = 1024 * 1024;
+
     pub fn new(
         device: &ash::Device,
         window_size: (u32, u32),
         deletion_queue: &mut DeletionQueue,
         bindless_set_layout: vk::DescriptorSetLayout,
         window: &Window,
+        submit_context: SubmitContext,
     ) -> Self {
         let vertex_shader =
             load_shader_module(device, include_bytes!("../shaders/spirv/egui.vert.spv")).expect("Failed to load vertex shader module");
@@ -71,7 +94,7 @@ impl EguiPipeline {
             device.destroy_shader_module(fragment_shader, None);
         }
 
-        deletion_queue.push(move |device| unsafe {
+        deletion_queue.push(move |device, allocator| unsafe {
             device.destroy_pipeline_layout(layout, None);
             device.destroy_pipeline(pipeline, None);
         });
@@ -85,27 +108,51 @@ impl EguiPipeline {
             height: window_size.1,
         });
 
-        let mesh = Mesh {
-            mem: None,
-            vertices: vec![],
-            indices: vec![],
-            normals: vec![],
-            uvs: vec![],
-        };
         let context = Context::default();
-        let egui_winit = egui_winit::State::new(context.clone(), context.viewport_id(), window, Some(window.scale_factor() as f32), None);
+        let egui_winit = egui_winit::State::new(
+            context.clone(),
+            context.viewport_id(),
+            window,
+            Some(window.scale_factor() as f32),
+            None,
+        );
+
+        let mesh_buffers: [(AllocatedBuffer, AllocatedBuffer); FRAME_OVERLAP] = core::array::from_fn(|_| {
+            let vertex_buffer = AllocatedBuffer::new(
+                device,
+                &mut submit_context.allocator.borrow_mut(),
+                vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                AllocUsage::Shared,
+                Self::VERTEX_BUFFER_SIZE as vk::DeviceSize,
+                Some("Egui Vertex Buffer".into()),
+            );
+            let index_buffer = AllocatedBuffer::new(
+                device,
+                &mut submit_context.allocator.borrow_mut(),
+                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                AllocUsage::Shared,
+                Self::INDEX_BUFFER_SIZE as vk::DeviceSize,
+                Some("Egui Index Buffer".into()),
+            );
+            (vertex_buffer, index_buffer)
+        });
         Self {
             viewport,
             scissor,
             pipeline,
             layout,
             window_size,
-            mesh,
             context,
             egui_winit,
+            textures: HashMap::new(),
+            mesh_buffers: mesh_buffers.into(),
+            bindless_set_layout,
+            raw_input: egui::RawInput::default(),
         }
     }
-
+    pub fn context(&self) -> &Context {
+        &self.context
+    }
     pub fn resize(&mut self, window_size: (u32, u32)) {
         self.window_size = window_size;
         self.viewport = vk::Viewport::default()
@@ -117,6 +164,14 @@ impl EguiPipeline {
             height: window_size.1,
         });
     }
+    pub fn begin_frame(&mut self, window: &Window) {
+        let raw_input = self.egui_winit.take_egui_input(window);
+        self.context.begin_frame(raw_input);
+    }
+    pub fn input(&mut self, window: &Window, event: &winit::event::WindowEvent) -> bool {
+        let res = self.egui_winit.on_window_event(window, event);
+        res.consumed
+    }
     pub fn draw(
         &mut self,
         device: &Device,
@@ -124,14 +179,15 @@ impl EguiPipeline {
         target_view: vk::ImageView,
         depth_view: vk::ImageView,
         bindless_descriptor_set: vk::DescriptorSet,
-        window: &Window,
         textures_delta: TexturesDelta,
         clipped_meshes: Vec<egui::ClippedPrimitive>,
+        texture_manager: &mut TextureManager,
+        submit_context: SubmitContext,
+        image_index: usize,
+        window: &Window,
     ) {
-        let raw_input = self.egui_winit.take_egui_input(window);
-        self.context.begin_frame(raw_input);
         for (id, image_delta) in textures_delta.set {
-            self.update_texture(id, image_delta);
+            self.update_texture(id, image_delta, submit_context.clone(), texture_manager);
         }
         let color_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(target_view)
@@ -157,26 +213,93 @@ impl EguiPipeline {
             })
             .layer_count(1)
             .view_mask(0);
-        for egui::ClippedPrimitive { clip_rect: _, primitive} in &clipped_meshes {
-            let mesh = match primitive {
-                Primitive::Mesh(mesh) => mesh,
-                Primitive::Callback(_) => unimplemented!()
-            };
-            if mesh.vertices.is_empty() || mesh.indices.is_empty() {
-                continue;
-            }
-            if let egui::TextureId::Managed(_id) = mesh.texture_id {
-                // todo bind texture with id `id`
-            } else {
-                todo!("user textures not supported yet")
-            }
-        }
-        let mut vertex_offset = 0;
-        let mut index_offset = 0;
-        for egui::ClippedPrimitive { clip_rect: _, primitive} in &clipped_meshes {
+
+        let mut vertex_buffer_ptr = unsafe {
+            self.mesh_buffers[image_index]
+                .0
+                .allocation
+                .map(device, 0, Self::VERTEX_BUFFER_SIZE)
+                .unwrap()
+                .as_ptr() as *mut Vertex
+        };
+        let vertex_buffer_end = unsafe { vertex_buffer_ptr.add(Self::VERTEX_BUFFER_SIZE) };
+        let mut index_buffer_ptr = unsafe {
+            self.mesh_buffers[image_index]
+                .1
+                .allocation
+                .map(device, 0, Self::INDEX_BUFFER_SIZE)
+                .unwrap()
+                .as_ptr() as *mut u32
+        };
+        let index_buffer_end = unsafe { index_buffer_ptr.add(Self::INDEX_BUFFER_SIZE) };
+        for egui::ClippedPrimitive { clip_rect: _, primitive } in &clipped_meshes {
             let emesh = match primitive {
                 Primitive::Mesh(mesh) => mesh,
-                Primitive::Callback(_) => unimplemented!()
+                Primitive::Callback(_) => unimplemented!(),
+            };
+            if emesh.vertices.is_empty() || emesh.indices.is_empty() {
+                continue;
+            }
+            let v_slice = &emesh
+                .vertices
+                .iter()
+                .map(|v| Vertex {
+                    pos: [v.pos.x, v.pos.y],
+                    uv: [v.uv.x, v.uv.y],
+                    color: v.color.a() as u32 | (v.color.b() as u32) << 8 | (v.color.g() as u32) << 16 | (v.color.r() as u32) << 24,
+                    padding: 0,
+                })
+                .collect::<Vec<_>>();
+            let v_copy_count = v_slice.len();
+
+            let i_slice = &emesh.indices;
+            let i_copy_count = i_slice.len();
+
+            let vertex_buffer_ptr_next = unsafe { vertex_buffer_ptr.add(v_copy_count) };
+            let index_buffer_ptr_next = unsafe { index_buffer_ptr.add(i_copy_count) };
+            if vertex_buffer_ptr_next > vertex_buffer_end || index_buffer_ptr_next > index_buffer_end {
+                panic!("egui vertex/index buffer overflow");
+            }
+            unsafe {
+                vertex_buffer_ptr.copy_from(v_slice.as_ptr().cast(), v_copy_count);
+                index_buffer_ptr.copy_from(i_slice.as_ptr().cast(), i_copy_count);
+            }
+            vertex_buffer_ptr = vertex_buffer_ptr_next;
+            index_buffer_ptr = index_buffer_ptr_next;
+        }
+
+        unsafe {
+            device.cmd_begin_rendering(cmd, &render_info);
+
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+
+            device.cmd_set_viewport(cmd, 0, &[self.viewport]);
+            device.cmd_set_scissor(cmd, 0, &[self.scissor]);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.layout,
+                0,
+                &[bindless_descriptor_set],
+                &[],
+            );
+        }
+        let device_address_info = vk::BufferDeviceAddressInfo::default().buffer(self.mesh_buffers[image_index].0.buffer);
+        let buffer_device_address = unsafe { device.get_buffer_device_address(&device_address_info) };
+
+        let mut vertex_offset = 0u32;
+        let mut index_offset = 0u32;
+
+        let push_constants = PushConstants {
+            screen_size: [self.window_size.0 as f32, self.window_size.1 as f32],
+            vertex_buffer: buffer_device_address,
+            font_texture_id: 0,
+            padding: 0,
+        };
+        for egui::ClippedPrimitive { clip_rect: _, primitive } in &clipped_meshes {
+            let emesh = match primitive {
+                Primitive::Mesh(mesh) => mesh,
+                Primitive::Callback(_) => unimplemented!(),
             };
             if emesh.vertices.is_empty() || emesh.indices.is_empty() {
                 continue;
@@ -187,26 +310,6 @@ impl EguiPipeline {
             // copy vertices and indices into mesh buffer
             // todo!();
             unsafe {
-                device.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.layout,
-                    0,
-                    &[bindless_descriptor_set],
-                    &[],
-                );
-                device.cmd_begin_rendering(cmd, &render_info);
-                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
-
-                device.cmd_set_viewport(cmd, 0, &[self.viewport]);
-                device.cmd_set_scissor(cmd, 0, &[self.scissor]);
-                let push_constants = PushConstants {
-                    screen_size: [self.window_size.0 as f32, self.window_size.1 as f32],
-                    vertex_buffer: self.mesh.vertex_buffer_address(),
-                    font_texture_id: 0,
-                    padding: 0,
-                };
-
                 device.cmd_push_constants(
                     cmd,
                     self.layout,
@@ -214,18 +317,73 @@ impl EguiPipeline {
                     0,
                     bytemuck::cast_slice(&[push_constants]),
                 );
-                device.cmd_bind_index_buffer(cmd, self.mesh.index_buffer(), 0, vk::IndexType::UINT32);
-                device.cmd_draw_indexed(cmd, self.mesh.indices.len() as u32, 1, 0, 0, 0);
-
-                device.cmd_end_rendering(cmd);
+                device.cmd_bind_index_buffer(cmd, self.mesh_buffers[image_index].1.buffer, 0, vk::IndexType::UINT32);
+                device.cmd_draw_indexed(cmd, indices.len() as u32, 1, index_offset, vertex_offset as i32, 0);
             }
-            vertex_offset += vertices.len();
-            index_offset += indices.len();
+            vertex_offset += vertices.len() as u32;
+            index_offset += indices.len() as u32;
         }
-
+        unsafe {
+            device.cmd_end_rendering(cmd);
+            self.mesh_buffers[image_index].0.allocation.unmap(device);
+            self.mesh_buffers[image_index].1.allocation.unmap(device);
+        }
+    }
+    pub fn end_frame(&mut self, window: &Window) -> FullOutput {
         let output = self.context.end_frame();
         self.egui_winit.handle_platform_output(window, output.platform_output.clone());
+        output
     }
 
-    fn update_texture(&mut self, _texture_id: TextureId, _delta: ImageDelta) {}
+    fn update_texture(
+        &mut self,
+        egui_texture_id: EguiTextureId,
+        delta: ImageDelta,
+        mut ctx: SubmitContext,
+        texture_manager: &mut TextureManager,
+    ) {
+        let data = match &delta.image {
+            ImageData::Color(image) => image.pixels.iter().flat_map(|color| color.to_array()).collect::<Vec<_>>(),
+            ImageData::Font(image) => image.srgba_pixels(None).flat_map(|color| color.to_array()).collect::<Vec<_>>(),
+        };
+        ctx.immediate_submit(Box::new(|ctx| {
+            if let Some(texture_id) = self.textures.get(&egui_texture_id) {
+                debug!("Replacing egui texture");
+                texture_manager.texture_mut(*texture_id).replace_image(
+                    ctx,
+                    Some(format!("egui texture, id: {:?}", egui_texture_id)),
+                    data.as_slice(),
+                    vk::Extent3D {
+                        width: delta.image.width() as u32,
+                        height: delta.image.height() as u32,
+                        depth: 1,
+                    },
+                );
+            } else {
+                debug!("Adding egui texture");
+                let texture = Texture::new(
+                    TextureManager::DEFAULT_SAMPLER_LINEAR,
+                    ctx,
+                    Some(format!("egui texture, id: {:?}", egui_texture_id)),
+                    data.as_slice(),
+                    vk::Extent3D {
+                        width: delta.image.width() as u32,
+                        height: delta.image.height() as u32,
+                        depth: 1,
+                    },
+                );
+                texture_manager.add_texture(texture, &ctx.device, true);
+            }
+        }))
+    }
+
+    pub fn destroy(&mut self, device: &Device, allocator: &mut Allocator) {
+        unsafe {
+            device.destroy_descriptor_set_layout(self.bindless_set_layout, None);
+        }
+        for buf in self.mesh_buffers.drain(..) {
+            buf.0.destroy(device, allocator);
+            buf.1.destroy(device, allocator);
+        }
+    }
 }

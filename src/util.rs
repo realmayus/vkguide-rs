@@ -1,4 +1,4 @@
-use crate::resources::{AllocatedBuffer, DescriptorAllocator};
+use crate::resources::{AllocatedBuffer, Allocator, DescriptorAllocator};
 use ash::{vk, Device};
 use glam::{Mat4, Vec4};
 use std::error::Error;
@@ -25,16 +25,16 @@ pub struct GpuSceneData {
 
 #[derive(Default)]
 pub(crate) struct DeletionQueue {
-    deletors: Vec<Box<dyn FnOnce(&Device) + Send>>,
+    deletors: Vec<Box<dyn FnOnce(&Device, &mut Allocator) + Send>>,
 }
 
 impl DeletionQueue {
-    pub(crate) fn push<T: 'static + FnOnce(&Device) + Send>(&mut self, deleter: T) {
+    pub(crate) fn push<T: 'static + FnOnce(&Device, &mut Allocator) + Send>(&mut self, deleter: T) {
         self.deletors.push(Box::new(deleter));
     }
-    pub(crate) fn flush(&mut self, device: &Device) {
+    pub(crate) fn flush(&mut self, device: &Device, allocator: &mut Allocator) {
         for deleter in self.deletors.drain(..) {
-            deleter(device);
+            deleter(device, allocator);
         }
     }
 }
@@ -66,12 +66,15 @@ impl DescriptorLayoutBuilder<'_> {
     }
 }
 pub mod device_discovery {
-    use ash::{vk, Instance, khr};
+    use ash::{khr, vk, Instance};
     use log::info;
     use std::ffi::CStr;
-    
 
-    pub(crate) fn pick_physical_device(instance: &Instance, surface: &khr::surface::Instance, surface_khr: vk::SurfaceKHR) -> vk::PhysicalDevice {
+    pub(crate) fn pick_physical_device(
+        instance: &Instance,
+        surface: &khr::surface::Instance,
+        surface_khr: vk::SurfaceKHR,
+    ) -> vk::PhysicalDevice {
         let devices = unsafe { instance.enumerate_physical_devices().unwrap() };
         let device = devices
             .into_iter()
@@ -85,7 +88,12 @@ pub mod device_discovery {
         device
     }
 
-    fn is_device_suitable(instance: &Instance, surface: &khr::surface::Instance, surface_khr: vk::SurfaceKHR, device: vk::PhysicalDevice) -> bool {
+    fn is_device_suitable(
+        instance: &Instance,
+        surface: &khr::surface::Instance,
+        surface_khr: vk::SurfaceKHR,
+        device: vk::PhysicalDevice,
+    ) -> bool {
         let (graphics, present) = find_queue_families(instance, surface, surface_khr, device);
         graphics.is_some() && present.is_some()
     }
@@ -105,7 +113,7 @@ pub mod device_discovery {
             if family.queue_flags.contains(vk::QueueFlags::GRAPHICS) && graphics.is_none() {
                 graphics = Some(index);
             }
-
+            let x = unsafe { surface.get_physical_device_surface_formats(device, surface_khr).unwrap() };
             let present_support = unsafe { surface.get_physical_device_surface_support(device, index, surface_khr).unwrap() };
             if present_support && present.is_none() {
                 present = Some(index);
@@ -120,6 +128,13 @@ pub mod device_discovery {
     }
 }
 
+pub fn encode_4_u8_as_3_f32(bytes: &[u8; 4]) -> [f32; 3] {
+    let mut result = [0.0; 3];
+    for i in 0..3 {
+        result[i] = bytes[i] as f32 / 255.0;
+    }
+    result
+}
 pub(crate) fn transition_image(
     device: &Device,
     cmd: vk::CommandBuffer,
@@ -142,14 +157,12 @@ pub(crate) fn transition_image(
                     vk::ImageAspectFlags::COLOR
                 })
                 .level_count(vk::REMAINING_MIP_LEVELS)
-                .layer_count(vk::REMAINING_ARRAY_LAYERS)
-            ,
+                .layer_count(vk::REMAINING_ARRAY_LAYERS),
         )
         .image(image);
 
     let binding = [image_barrier];
-    let dependency_info = vk::DependencyInfoKHR::default()
-        .image_memory_barriers(&binding);
+    let dependency_info = vk::DependencyInfoKHR::default().image_memory_barriers(&binding);
 
     unsafe { device.cmd_pipeline_barrier2(cmd, &dependency_info) }
 }
@@ -191,8 +204,7 @@ pub(crate) fn copy_image_to_image(
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .mip_level(0)
                 .base_array_layer(0)
-                .layer_count(1)
-            ,
+                .layer_count(1),
         );
 
     let regions = [blit_region];

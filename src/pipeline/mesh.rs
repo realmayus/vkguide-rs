@@ -1,6 +1,6 @@
 use crate::pipeline::PipelineBuilder;
-use crate::util::{load_shader_module, DeletionQueue};
 use crate::scene::mesh::Mesh;
+use crate::util::{load_shader_module, DeletionQueue};
 use ash::{vk, Device};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
@@ -21,7 +21,12 @@ pub(crate) struct PushConstants {
 }
 
 impl MeshPipeline {
-    pub fn new(device: &ash::Device, window_size: (u32, u32), deletion_queue: &mut DeletionQueue, bindless_set_layout: vk::DescriptorSetLayout) -> Self {
+    pub fn new(
+        device: &ash::Device,
+        window_size: (u32, u32),
+        deletion_queue: &mut DeletionQueue,
+        bindless_set_layout: vk::DescriptorSetLayout,
+    ) -> Self {
         let vertex_shader =
             load_shader_module(device, include_bytes!("../shaders/spirv/mesh.vert.spv")).expect("Failed to load vertex shader module");
         let fragment_shader =
@@ -58,7 +63,7 @@ impl MeshPipeline {
             device.destroy_shader_module(fragment_shader, None);
         }
 
-        deletion_queue.push(move |device| unsafe {
+        deletion_queue.push(move |device, allocator| unsafe {
             device.destroy_pipeline_layout(layout, None);
             device.destroy_pipeline(pipeline, None);
         });
@@ -92,7 +97,15 @@ impl MeshPipeline {
             height: window_size.1,
         });
     }
-    pub fn draw(&self, device: &Device, cmd: vk::CommandBuffer, meshes: &[Mesh], target_view: vk::ImageView, depth_view: vk::ImageView, bindless_descriptor_set: vk::DescriptorSet) {
+    pub fn draw(
+        &self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+        meshes: &[Mesh],
+        target_view: vk::ImageView,
+        depth_view: vk::ImageView,
+        bindless_descriptor_set: vk::DescriptorSet,
+    ) {
         let color_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(target_view)
             .image_layout(vk::ImageLayout::GENERAL);
@@ -131,7 +144,14 @@ impl MeshPipeline {
         };
 
         unsafe {
-            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[bindless_descriptor_set], &[]);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.layout,
+                0,
+                &[bindless_descriptor_set],
+                &[],
+            );
             device.cmd_begin_rendering(cmd, &render_info);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
 

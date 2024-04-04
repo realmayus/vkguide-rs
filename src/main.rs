@@ -3,34 +3,37 @@ extern crate core;
 mod gltf;
 mod pipeline;
 mod resources;
-mod util;
-mod ui;
 mod scene;
+mod ui;
+mod util;
 
-use std::cell::RefCell;
-use crate::resources::{AllocUsage, AllocatedBuffer, AllocatedImage, Allocator, DescriptorAllocator, PoolSizeRatio, TextureManager, DescriptorImageWriteInfo, update_set, DescriptorBufferWriteInfo};
+use crate::resources::{
+    update_set, AllocUsage, AllocatedBuffer, AllocatedImage, Allocator, DescriptorAllocator, DescriptorBufferWriteInfo,
+    DescriptorImageWriteInfo, PoolSizeRatio, TextureManager,
+};
 use crate::util::{device_discovery, DeletionQueue, DescriptorLayoutBuilder, GpuSceneData};
+use ash::khr::swapchain;
 use ash::vk::{DescriptorSet, DescriptorSetLayout};
-use ash::{vk, Device, Instance, khr};
-use glam::{Vec3};
+use ash::{khr, vk, Device, Instance};
+use glam::Vec3;
 use gpu_alloc::GpuAllocator;
 use gpu_alloc_ash::{device_properties, AshMemoryDevice};
 use log::{debug, info};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use std::cell::RefCell;
 use std::error::Error;
 use std::path::Path;
 use std::rc::Rc;
-use ash::khr::{swapchain};
 use util::FrameData;
 use winit::{
     dpi::PhysicalSize,
     event::{Event, WindowEvent},
-    event_loop::{EventLoop},
+    event_loop::EventLoop,
     window::WindowBuilder,
 };
 
+use crate::pipeline::egui::EguiPipeline;
 use crate::pipeline::mesh::MeshPipeline;
-
 use crate::scene::mesh::Mesh;
 
 const FRAME_OVERLAP: usize = 2;
@@ -57,7 +60,9 @@ struct App {
     descriptor_allocator: DescriptorAllocator,
     draw_image_descriptor_set: vk::DescriptorSet,
     draw_image_descriptor_set_layout: vk::DescriptorSetLayout,
+    bindless_descriptor_pool: vk::DescriptorPool,
     mesh_pipeline: MeshPipeline,
+    egui_pipeline: EguiPipeline,
     immediate_fence: vk::Fence,
     immediate_command_pool: vk::CommandPool,
     immediate_command_buffer: vk::CommandBuffer,
@@ -106,9 +111,7 @@ impl SubmitContext {
             let cmd_buffer_submits = [cmd_buffer_submit];
             let submit_info = vk::SubmitInfo2::default().command_buffer_infos(&cmd_buffer_submits);
             let submits = [submit_info];
-            self.device
-                .queue_submit2(self.queue, &submits, self.fence)
-                .unwrap();
+            self.device.queue_submit2(self.queue, &submits, self.fence).unwrap();
             self.device.wait_for_fences(&[self.fence], true, 1000000000).unwrap();
             if self.cleanup.is_some() {
                 self.cleanup.take().unwrap()(&self.device, &mut self.allocator.borrow_mut());
@@ -118,11 +121,22 @@ impl SubmitContext {
     }
 }
 
+impl Clone for SubmitContext {
+    fn clone(&self) -> Self {
+        Self {
+            device: self.device.clone(),
+            allocator: self.allocator.clone(),
+            fence: self.fence,
+            cmd_buffer: self.cmd_buffer,
+            queue: self.queue,
+            cleanup: None,
+        }
+    }
+}
 
-pub const SWAPCHAIN_IMAGE_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
+pub const SWAPCHAIN_IMAGE_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 pub const API_VERSION: u32 = vk::make_api_version(0, 1, 3, 0);
-
 
 impl App {
     fn new(event_loop: &EventLoop<()>) -> Result<Self, Box<dyn Error>> {
@@ -143,7 +157,13 @@ impl App {
                 .build(event_loop)?;
 
             // Create a surface from winit window.
-            let surface_khr = ash_window::create_surface(&entry, &instance, window.display_handle()?.as_raw(), window.window_handle()?.as_raw(), None)?;
+            let surface_khr = ash_window::create_surface(
+                &entry,
+                &instance,
+                window.display_handle()?.as_raw(),
+                window.window_handle()?.as_raw(),
+                None,
+            )?;
             let surface = khr::surface::Instance::new(&entry, &instance);
             (instance, surface_khr, surface, entry, window)
         };
@@ -162,12 +182,26 @@ impl App {
             Self::init_commands(graphics_queue.1, &device, &mut deletion_queue);
         let (descriptor_allocator, draw_image_descriptor_set_layout, draw_image_descriptor_set, scene_data_layout) =
             Self::init_descriptors(&device, draw_image.view, &mut deletion_queue);
-        let (bindless_descriptor_set, bindless_set_layout) = Self::init_bindless(&device);
+        let (bindless_descriptor_pool, bindless_descriptor_set, bindless_set_layout) = Self::init_bindless(&device);
         let mesh_pipeline = MeshPipeline::new(&device, window_size, &mut deletion_queue, bindless_set_layout);
-        
         let device = Rc::new(device);
-        let allocator= Rc::new(RefCell::new(allocator));
-        
+        let allocator = Rc::new(RefCell::new(allocator));
+
+        let egui_pipeline = EguiPipeline::new(
+            &device,
+            window_size,
+            &mut deletion_queue,
+            bindless_set_layout,
+            &window,
+            SubmitContext {
+                device: device.clone(),
+                allocator: allocator.clone(),
+                fence: immediate_fence,
+                cmd_buffer: immediate_command_buffer,
+                queue: graphics_queue.0,
+                cleanup: None,
+            },
+        );
         let texture_manager = SubmitContext {
             device: device.clone(),
             allocator: allocator.clone(),
@@ -175,7 +209,9 @@ impl App {
             cmd_buffer: immediate_command_buffer,
             queue: graphics_queue.0,
             cleanup: None,
-        }.immediate_submit(Box::new(|ctx| TextureManager::new(bindless_descriptor_set, ctx)));
+        }
+        .immediate_submit(Box::new(|ctx| TextureManager::new(bindless_descriptor_set, ctx)));
+        info!("Init done.");
         Ok(App {
             entry,
             instance,
@@ -199,7 +235,9 @@ impl App {
             descriptor_allocator,
             draw_image_descriptor_set,
             draw_image_descriptor_set_layout,
+            bindless_descriptor_pool,
             mesh_pipeline,
+            egui_pipeline,
             immediate_command_pool,
             immediate_command_buffer,
             immediate_fence,
@@ -356,7 +394,7 @@ impl App {
             SWAPCHAIN_IMAGE_FORMAT,
             vk::ImageUsageFlags::TRANSFER_DST
                 | vk::ImageUsageFlags::TRANSFER_SRC
-                | vk::ImageUsageFlags::STORAGE
+                // | vk::ImageUsageFlags::STORAGE
                 | vk::ImageUsageFlags::COLOR_ATTACHMENT,
             AllocUsage::GpuOnly,
             vk::ImageAspectFlags::COLOR,
@@ -399,7 +437,7 @@ impl App {
             .command_buffer_count(1);
         let immediate_command_buffer = unsafe { device.allocate_command_buffers(&immediate_alloc_info).unwrap()[0] };
         let immediate_fence = unsafe { device.create_fence(&fence_create_info, None).unwrap() };
-        deletion_queue.push(move |device| unsafe {
+        deletion_queue.push(move |device, allocator| unsafe {
             device.destroy_command_pool(immediate_command_pool, None);
             device.destroy_fence(immediate_fence, None);
         });
@@ -460,7 +498,7 @@ impl App {
     pub const STORAGE_BUFFER_BINDING: u32 = 0;
     pub const STORAGE_IMAGE_BINDING: u32 = 1;
     pub const TEXTURE_BINDING: u32 = 2;
-    fn init_bindless(device: &Device) -> (DescriptorSet, DescriptorSetLayout) {
+    fn init_bindless(device: &Device) -> (vk::DescriptorPool, DescriptorSet, DescriptorSetLayout) {
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -521,6 +559,7 @@ impl App {
         };
 
         (
+            descriptor_pool,
             unsafe {
                 device
                     .allocate_descriptor_sets(
@@ -553,23 +592,24 @@ impl App {
         let layout = builder.build(device);
         let descriptor_set = descriptor_pool.allocate(device, layout);
 
-        update_set(device, descriptor_set, &[
-            DescriptorImageWriteInfo {
-                binding: 0,
-                array_index: 0,
-                image_view: draw_image,
-                sampler: vk::Sampler::null(),
-                layout: vk::ImageLayout::GENERAL,
-                ty: vk::DescriptorType::STORAGE_IMAGE,
-            },
-        ], &[]);
+        // update_set(device, descriptor_set, &[
+        //     DescriptorImageWriteInfo {
+        //         binding: 0,
+        //         array_index: 0,
+        //         image_view: draw_image,
+        //         sampler: vk::Sampler::null(),
+        //         layout: vk::ImageLayout::GENERAL,
+        //         ty: vk::DescriptorType::STORAGE_IMAGE,
+        //     },
+        // ], &[]);
+
         let scene_info_builder = DescriptorLayoutBuilder::default().add_binding(
             0,
             vk::DescriptorType::UNIFORM_BUFFER,
             vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
         );
         let scene_info_layout = scene_info_builder.build(device);
-        deletion_queue.push(move |device| unsafe {
+        deletion_queue.push(move |device, allocator| unsafe {
             device.destroy_descriptor_set_layout(layout, None);
             device.destroy_descriptor_set_layout(scene_info_layout, None);
         });
@@ -587,13 +627,20 @@ impl App {
         debug!("Resizing to {:?}", size);
         self.resize_swapchain(size);
         self.mesh_pipeline.resize(size);
+        self.egui_pipeline.resize(size);
     }
     fn resize_swapchain(&mut self, size: (u32, u32)) {
         unsafe {
             self.device.device_wait_idle().unwrap();
             self.destroy_swapchain();
-            self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator.borrow_mut());
-            self.depth_image.take().unwrap().destroy(&self.device, &mut self.allocator.borrow_mut());
+            self.draw_image
+                .take()
+                .unwrap()
+                .destroy(&self.device, &mut self.allocator.borrow_mut());
+            self.depth_image
+                .take()
+                .unwrap()
+                .destroy(&self.device, &mut self.allocator.borrow_mut());
         }
         self.window_size = size;
         let capabilities = unsafe {
@@ -628,7 +675,7 @@ impl App {
                 .wait_for_fences(&[self.current_frame().render_fence], true, 1000000000)
                 .unwrap();
             let device = self.device.clone();
-            frame!(self).deletion_queue.flush(&device);
+            frame!(self).deletion_queue.flush(&device, &mut self.allocator.borrow_mut());
             frame!(self).descriptor_allocator.clear_pools(&device);
             for buffer in frame!(self).stale_buffers.drain(..) {
                 buffer.destroy(&device, &mut self.allocator.borrow_mut());
@@ -699,16 +746,19 @@ impl App {
             scene_data_ptr.copy_from_nonoverlapping(&self.scene_data, 1);
             let global_descriptor = frame!(self).descriptor_allocator.allocate(&self.device, self.scene_data_layout);
 
-            update_set(&self.device, global_descriptor, &[], &[
-                DescriptorBufferWriteInfo {
+            update_set(
+                &self.device,
+                global_descriptor,
+                &[],
+                &[DescriptorBufferWriteInfo {
                     binding: 0,
                     array_index: 0,
                     buffer: scene_data_buffer.buffer,
                     size: std::mem::size_of::<GpuSceneData>() as vk::DeviceSize,
                     offset: 0,
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
-                }
-            ]);
+                }],
+            );
 
             frame!(self).stale_buffers.push(scene_data_buffer);
 
@@ -719,6 +769,38 @@ impl App {
                 self.draw_image.as_ref().unwrap().view,
                 self.depth_image.as_ref().unwrap().view,
                 self.texture_manager.descriptor_set(),
+            );
+
+            let ctx = SubmitContext::new(self);
+            self.egui_pipeline.begin_frame(&self.window);
+            let egui_ctx = self.egui_pipeline.context();
+            egui::Window::new( "Hello world!").show(egui_ctx, |ui| {
+                ui.label("Hello World!");
+                ui.add(egui::Slider::new(&mut self.scene_data.sun_dir.x, 69.0..=420.0).text("AWESOMENESS"));
+                if ui.button("FINALLY!!!!!").clicked() {
+                    debug!("huge W");
+                }
+                ui.label("You cannot believe how long this took me... You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...v");
+            });
+
+            let output = self.egui_pipeline.end_frame(&self.window);
+            let meshes = self
+                .egui_pipeline
+                .context()
+                .tessellate(output.shapes, self.window.scale_factor() as f32);
+
+            self.egui_pipeline.draw(
+                &self.device,
+                cmd_buffer,
+                self.draw_image.as_ref().unwrap().view,
+                self.depth_image.as_ref().unwrap().view,
+                self.texture_manager.descriptor_set(),
+                output.textures_delta,
+                meshes,
+                &mut self.texture_manager,
+                ctx,
+                (self.current_frame % FRAME_OVERLAP as u32) as usize,
+                &self.window,
             );
 
             // prepare copying of the draw image to the swapchain image
@@ -814,23 +896,34 @@ impl App {
             );
         }
     }
+
+    fn input(&mut self, event: &winit::event::WindowEvent) -> bool {
+        self.egui_pipeline.input(&self.window, event)
+    }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
         unsafe {
             self.device.device_wait_idle().unwrap();
-            self.main_deletion_queue.flush(&self.device);
+            self.main_deletion_queue.flush(&self.device, &mut self.allocator.borrow_mut());
             self.descriptor_allocator.destroy_pools(&self.device);
-            for mesh in self.meshes.drain(..) {
+            self.device.destroy_descriptor_pool(self.bindless_descriptor_pool, None);
+            for mut mesh in self.meshes.drain(..) {
                 mesh.destroy(&self.device, &mut self.allocator.borrow_mut());
             }
 
-            self.draw_image.take().unwrap().destroy(&self.device, &mut self.allocator.borrow_mut());
-            self.depth_image.take().unwrap().destroy(&self.device, &mut self.allocator.borrow_mut());
+            self.draw_image
+                .take()
+                .unwrap()
+                .destroy(&self.device, &mut self.allocator.borrow_mut());
+            self.depth_image
+                .take()
+                .unwrap()
+                .destroy(&self.device, &mut self.allocator.borrow_mut());
             self.texture_manager.destroy(&self.device, &mut self.allocator.borrow_mut());
             for frame in self.frames.iter_mut() {
-                frame.deletion_queue.flush(&self.device); // take care of frames that were prepared but not reached in the render loop yet
+                frame.deletion_queue.flush(&self.device, &mut self.allocator.borrow_mut()); // take care of frames that were prepared but not reached in the render loop yet
                 for buffer in frame.stale_buffers.drain(..) {
                     buffer.destroy(&self.device, &mut self.allocator.borrow_mut());
                 }
@@ -841,6 +934,7 @@ impl Drop for App {
                 self.device.destroy_semaphore(frame.render_semaphore, None);
                 frame.descriptor_allocator.destroy_pools(&self.device);
             }
+            self.egui_pipeline.destroy(&self.device, &mut self.allocator.borrow_mut());
             self.destroy_swapchain();
             self.device.destroy_device(None);
             self.surface_fn.destroy_surface(self.surface, None);
@@ -867,18 +961,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     Ok(event_loop.unwrap().run(move |event, target| match event {
         Event::WindowEvent {
-            event:
-            WindowEvent::CloseRequested
-            | WindowEvent::KeyboardInput {
-                event: winit::event::KeyEvent {
-                    logical_key: winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape),
-                    ..
-                },
-                ..
-            },
-            window_id: _,
+            event: WindowEvent::RedrawRequested,
+            ..
         } => {
-            target.exit();
+            app.draw();
+            app.window.request_redraw();
         }
         Event::WindowEvent {
             event: WindowEvent::Resized(size),
@@ -887,11 +974,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             app.resize((size.width, size.height));
         }
         Event::WindowEvent {
-            event: WindowEvent::RedrawRequested,
-            ..
+            event:
+                WindowEvent::CloseRequested
+                | WindowEvent::KeyboardInput {
+                    event:
+                        winit::event::KeyEvent {
+                            logical_key: winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape),
+                            ..
+                        },
+                    ..
+                },
+            window_id: _,
         } => {
-            app.draw();
-            app.window.request_redraw();
+            target.exit();
+        }
+
+        Event::WindowEvent { event, .. } => {
+            app.input(&event);
         }
         _ => {}
     })?)

@@ -1,11 +1,10 @@
-use ash::{Device, vk};
+use crate::pipeline::Vertex;
+use crate::resources::{AllocUsage, AllocatedBuffer, Allocator};
+use crate::SubmitContext;
+use ash::{vk, Device};
 use glam::{Vec2, Vec3};
 use gpu_alloc_ash::AshMemoryDevice;
 use log::{debug, info};
-use crate::{SubmitContext};
-use crate::pipeline::Vertex;
-use crate::resources::{AllocatedBuffer, Allocator, AllocUsage};
-
 
 pub struct GpuMesh {
     index_buffer: AllocatedBuffer,
@@ -13,7 +12,7 @@ pub struct GpuMesh {
     vertex_address: vk::DeviceAddress,
 }
 
-
+#[derive(Default)]
 pub struct Mesh {
     pub(crate) mem: Option<GpuMesh>,
     pub(crate) vertices: Vec<Vec3>,
@@ -23,10 +22,13 @@ pub struct Mesh {
 }
 
 impl Mesh {
+    pub fn clear(&mut self) {
+        self.vertices.clear();
+        self.indices.clear();
+        self.normals.clear();
+        self.uvs.clear();
+    }
     pub fn upload(&mut self, ctx: &mut SubmitContext) {
-        info!("Uploading mesh to GPU");
-        debug!("Mesh vertices: {:?}", self.vertices);
-
         let vertices = self
             .vertices
             .iter()
@@ -100,7 +102,8 @@ impl Mesh {
             size: index_buffer_size,
         };
         unsafe {
-            ctx.device.cmd_copy_buffer(ctx.cmd_buffer, staging.buffer, index_buffer.buffer, &[index_copy]);
+            ctx.device
+                .cmd_copy_buffer(ctx.cmd_buffer, staging.buffer, index_buffer.buffer, &[index_copy]);
         };
         // return empty FnOnce closure
 
@@ -114,16 +117,16 @@ impl Mesh {
             staging.destroy(device, allocator);
         }));
     }
-    
+
     pub fn vertex_buffer_address(&self) -> vk::DeviceAddress {
         self.mem.as_ref().unwrap().vertex_address
     }
     pub fn index_buffer(&self) -> vk::Buffer {
         self.mem.as_ref().unwrap().index_buffer.buffer
     }
-    
-    pub fn destroy(self, device: &Device, allocator: &mut Allocator) {
-        if let Some(mem) = self.mem {
+
+    pub fn destroy(&mut self, device: &Device, allocator: &mut Allocator) {
+        if let Some(mem) = self.mem.take() {
             mem.vertex_buffer.destroy(device, allocator);
             mem.index_buffer.destroy(device, allocator);
         }

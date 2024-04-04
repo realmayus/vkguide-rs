@@ -12,5 +12,5 @@ layout (set = 0, binding = 2) uniform sampler2D tex[];
 
 void main() {
 
-    outColor = inColor * texture(tex[fontTextureId], inUV);
+    outColor = inColor * texture(tex[3], inUV);
 }
