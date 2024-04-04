@@ -57,9 +57,10 @@ struct App {
     allocator: Rc<RefCell<Allocator>>,
     main_deletion_queue: DeletionQueue,
     draw_image: Option<AllocatedImage>,
-    descriptor_allocator: DescriptorAllocator,
+    unorm_draw_image_view: vk::ImageView,
     draw_image_descriptor_set: vk::DescriptorSet,
     draw_image_descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_allocator: DescriptorAllocator,
     bindless_descriptor_pool: vk::DescriptorPool,
     mesh_pipeline: MeshPipeline,
     egui_pipeline: EguiPipeline,
@@ -176,7 +177,7 @@ impl App {
         let mut allocator = GpuAllocator::new(config, device_properties);
 
         let capabilities = unsafe { surface.get_physical_device_surface_capabilities(physical_device, surface_khr) }?;
-        let ((swapchain, swapchain_khr), swapchain_images, swapchain_views, draw_image, depth_image) =
+        let ((swapchain, swapchain_khr), swapchain_images, swapchain_views, draw_image, unorm_draw_image_view, depth_image) =
             Self::create_swapchain(&instance, &device, surface_khr, capabilities, &mut allocator, window_size);
         let (immediate_command_pool, immediate_command_buffer, immediate_fence, frames) =
             Self::init_commands(graphics_queue.1, &device, &mut deletion_queue);
@@ -231,6 +232,7 @@ impl App {
             allocator,
             main_deletion_queue: deletion_queue,
             draw_image: Some(draw_image), // must be present at all times, Option<_> because we need ownership when destroying
+            unorm_draw_image_view,
             depth_image: Some(depth_image),
             descriptor_allocator,
             draw_image_descriptor_set,
@@ -336,6 +338,7 @@ impl App {
         Vec<vk::Image>,
         Vec<vk::ImageView>,
         AllocatedImage,
+        vk::ImageView,
         AllocatedImage,
     ) {
         let create_info = vk::SwapchainCreateInfoKHR {
@@ -398,8 +401,34 @@ impl App {
                 | vk::ImageUsageFlags::COLOR_ATTACHMENT,
             AllocUsage::GpuOnly,
             vk::ImageAspectFlags::COLOR,
+            vk::ImageCreateFlags::MUTABLE_FORMAT,
             Some("Draw Image".into()),
         );
+
+        let unorm_draw_image_view = unsafe {
+            device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(draw_image.image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .components(vk::ComponentMapping {
+                            r: vk::ComponentSwizzle::IDENTITY,
+                            g: vk::ComponentSwizzle::IDENTITY,
+                            b: vk::ComponentSwizzle::IDENTITY,
+                            a: vk::ComponentSwizzle::IDENTITY,
+                        })
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        }),
+                    None,
+                )
+                .unwrap()
+        };
 
         let depth_image = AllocatedImage::new(
             device,
@@ -413,10 +442,18 @@ impl App {
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             AllocUsage::GpuOnly,
             vk::ImageAspectFlags::DEPTH,
+            vk::ImageCreateFlags::empty(),
             Some("Depth Image".into()),
         );
 
-        ((swapchain, swapchain_khr), images, image_views, draw_image, depth_image)
+        (
+            (swapchain, swapchain_khr),
+            images,
+            image_views,
+            draw_image,
+            unorm_draw_image_view,
+            depth_image,
+        )
     }
 
     fn init_commands(
@@ -648,7 +685,7 @@ impl App {
                 .get_physical_device_surface_capabilities(self.physical_device, self.surface)
                 .unwrap()
         };
-        let (swapchain, swapchain_images, swapchain_views, draw_image, depth_image) = Self::create_swapchain(
+        let (swapchain, swapchain_images, swapchain_views, draw_image, unorm_draw_image_view, depth_image) = Self::create_swapchain(
             &self.instance,
             &self.device,
             self.surface,
@@ -661,6 +698,7 @@ impl App {
         self.swapchain_views = swapchain_views;
         self.draw_image = Some(draw_image);
         self.depth_image = Some(depth_image);
+        self.unorm_draw_image_view = unorm_draw_image_view;
     }
 
     // https://i.imgflip.com/8l3uzz.jpg
@@ -792,7 +830,7 @@ impl App {
             self.egui_pipeline.draw(
                 &self.device,
                 cmd_buffer,
-                self.draw_image.as_ref().unwrap().view,
+                self.unorm_draw_image_view,
                 self.depth_image.as_ref().unwrap().view,
                 self.texture_manager.descriptor_set(),
                 output.textures_delta,
@@ -913,6 +951,7 @@ impl Drop for App {
                 mesh.destroy(&self.device, &mut self.allocator.borrow_mut());
             }
 
+            self.device.destroy_image_view(self.unorm_draw_image_view, None);
             self.draw_image
                 .take()
                 .unwrap()

@@ -1,8 +1,8 @@
 use crate::pipeline::PipelineBuilder;
 use crate::resources::{AllocUsage, AllocatedBuffer, Allocator, Texture, TextureId, TextureManager};
 use crate::scene::mesh::Mesh;
-use crate::util::{encode_4_u8_as_3_f32, load_shader_module, DeletionQueue};
-use crate::{SubmitContext, FRAME_OVERLAP};
+use crate::util::{load_shader_module, DeletionQueue};
+use crate::{SubmitContext, DEPTH_FORMAT, FRAME_OVERLAP};
 use ash::{vk, Device};
 use bytemuck::{Pod, Zeroable};
 use egui::ahash::{HashMap, HashMapExt};
@@ -84,6 +84,15 @@ impl EguiPipeline {
                     .module(fragment_shader)
                     .name(CStr::from_bytes_with_nul(b"main\0").unwrap()),
             ],
+            color_blend_attachment: vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(false)
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .src_color_blend_factor(vk::BlendFactor::ONE)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE),
+            render_info: vk::PipelineRenderingCreateInfo::default()
+                .color_attachment_formats(&[vk::Format::R8G8B8A8_UNORM])
+                .depth_attachment_format(DEPTH_FORMAT),
             ..Default::default()
         };
 

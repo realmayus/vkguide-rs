@@ -23,7 +23,6 @@ pub struct PipelineBuilder<'a> {
     pub layout: Option<vk::PipelineLayout>,
     pub depth_stencil: vk::PipelineDepthStencilStateCreateInfo<'a>,
     pub render_info: vk::PipelineRenderingCreateInfo<'a>,
-    pub color_attachment_format: vk::Format,
 }
 impl PipelineBuilder<'_> {
     pub(crate) fn build(mut self, device: &Device) -> vk::Pipeline {
@@ -31,9 +30,7 @@ impl PipelineBuilder<'_> {
             .viewport_count(1) // dynamic state allows us to only specify count
             .scissor_count(1);
         let color_blend_attachments = [self.color_blend_attachment];
-        let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
-            .attachments(&color_blend_attachments)
-            .logic_op(vk::LogicOp::COPY);
+        let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
         // we don't need this as we're using dynamic state
         let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
         let dynamic_state = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
@@ -92,7 +89,6 @@ impl Default for PipelineBuilder<'_> {
             render_info: vk::PipelineRenderingCreateInfo::default()
                 .color_attachment_formats(&[SWAPCHAIN_IMAGE_FORMAT])
                 .depth_attachment_format(DEPTH_FORMAT),
-            color_attachment_format: SWAPCHAIN_IMAGE_FORMAT,
         }
     }
 }

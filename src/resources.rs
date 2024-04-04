@@ -290,6 +290,7 @@ impl AllocatedImage {
         image_usages: vk::ImageUsageFlags,
         alloc_usages: AllocUsage,
         image_aspect: vk::ImageAspectFlags,
+        flags: vk::ImageCreateFlags,
         label: Option<String>,
     ) -> Self {
         let info = vk::ImageCreateInfo::default()
@@ -297,7 +298,7 @@ impl AllocatedImage {
             .format(format)
             .extent(extent)
             .mip_levels(1)
-            .flags(vk::ImageCreateFlags::empty())
+            .flags(flags)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
@@ -453,6 +454,7 @@ impl Texture {
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
             AllocUsage::GpuOnly,
             vk::ImageAspectFlags::COLOR,
+            vk::ImageCreateFlags::empty(),
             label,
         );
 
@@ -470,10 +472,11 @@ impl Texture {
             &ctx.device,
             &mut ctx.allocator.borrow_mut(),
             extent,
-            vk::Format::R8G8B8A8_UNORM,
+            vk::Format::R8G8B8A8_SRGB,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
             AllocUsage::GpuOnly,
             vk::ImageAspectFlags::COLOR,
+            vk::ImageCreateFlags::empty(),
             label,
         );
 

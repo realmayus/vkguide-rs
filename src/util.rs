@@ -128,13 +128,6 @@ pub mod device_discovery {
     }
 }
 
-pub fn encode_4_u8_as_3_f32(bytes: &[u8; 4]) -> [f32; 3] {
-    let mut result = [0.0; 3];
-    for i in 0..3 {
-        result[i] = bytes[i] as f32 / 255.0;
-    }
-    result
-}
 pub(crate) fn transition_image(
     device: &Device,
     cmd: vk::CommandBuffer,
