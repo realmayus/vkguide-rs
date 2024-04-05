@@ -74,6 +74,15 @@ impl EguiPipeline {
         let layout = unsafe { device.create_pipeline_layout(&layout_create_info, None).unwrap() };
         let pipeline_builder = PipelineBuilder {
             layout: Some(layout),
+            color_blend_attachment: vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(true)
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .src_color_blend_factor(vk::BlendFactor::ONE)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_DST_ALPHA)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+                .alpha_blend_op(vk::BlendOp::ADD),
             shader_stages: vec![
                 vk::PipelineShaderStageCreateInfo::default()
                     .stage(vk::ShaderStageFlags::VERTEX)
@@ -84,15 +93,7 @@ impl EguiPipeline {
                     .module(fragment_shader)
                     .name(CStr::from_bytes_with_nul(b"main\0").unwrap()),
             ],
-            color_blend_attachment: vk::PipelineColorBlendAttachmentState::default()
-                .blend_enable(false)
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
-                .src_color_blend_factor(vk::BlendFactor::ONE)
-                .src_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-                .dst_alpha_blend_factor(vk::BlendFactor::ONE),
-            render_info: vk::PipelineRenderingCreateInfo::default()
-                .color_attachment_formats(&[vk::Format::R8G8B8A8_UNORM])
-                .depth_attachment_format(DEPTH_FORMAT),
+            render_info: vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&[vk::Format::B8G8R8A8_UNORM]),
             ..Default::default()
         };
 
@@ -202,14 +203,7 @@ impl EguiPipeline {
             .image_view(target_view)
             .image_layout(vk::ImageLayout::GENERAL);
         let color_attachments = [color_attachment];
-        let depth_attachment = vk::RenderingAttachmentInfo::default()
-            .image_view(depth_view)
-            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(vk::ClearValue {
-                depth_stencil: vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 },
-            });
+        let depth_attachment = vk::RenderingAttachmentInfo::default();
         let render_info = vk::RenderingInfo::default()
             .color_attachments(&color_attachments)
             .depth_attachment(&depth_attachment)
@@ -240,6 +234,7 @@ impl EguiPipeline {
                 .unwrap()
                 .as_ptr() as *mut u32
         };
+
         let index_buffer_end = unsafe { index_buffer_ptr.add(Self::INDEX_BUFFER_SIZE) };
         for egui::ClippedPrimitive { clip_rect: _, primitive } in &clipped_meshes {
             let emesh = match primitive {
@@ -299,12 +294,6 @@ impl EguiPipeline {
         let mut vertex_offset = 0u32;
         let mut index_offset = 0u32;
 
-        let push_constants = PushConstants {
-            screen_size: [self.window_size.0 as f32, self.window_size.1 as f32],
-            vertex_buffer: buffer_device_address,
-            font_texture_id: 0,
-            padding: 0,
-        };
         for egui::ClippedPrimitive { clip_rect: _, primitive } in &clipped_meshes {
             let emesh = match primitive {
                 Primitive::Mesh(mesh) => mesh,
@@ -314,6 +303,12 @@ impl EguiPipeline {
                 continue;
             }
 
+            let push_constants = PushConstants {
+                screen_size: [self.window_size.0 as f32, self.window_size.1 as f32],
+                vertex_buffer: buffer_device_address,
+                font_texture_id: self.textures[&emesh.texture_id] as u32,
+                padding: 0,
+            };
             let vertices = &emesh.vertices;
             let indices = &emesh.indices;
             // copy vertices and indices into mesh buffer
@@ -371,7 +366,7 @@ impl EguiPipeline {
             } else {
                 debug!("Adding egui texture");
                 let texture = Texture::new(
-                    TextureManager::DEFAULT_SAMPLER_LINEAR,
+                    TextureManager::DEFAULT_SAMPLER_NEAREST,
                     ctx,
                     Some(format!("egui texture, id: {:?}", egui_texture_id)),
                     data.as_slice(),
@@ -381,7 +376,8 @@ impl EguiPipeline {
                         depth: 1,
                     },
                 );
-                texture_manager.add_texture(texture, &ctx.device, true);
+                let id = texture_manager.add_texture(texture, &ctx.device, true);
+                self.textures.insert(egui_texture_id, id);
             }
         }))
     }

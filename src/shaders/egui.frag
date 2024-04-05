@@ -22,6 +22,6 @@ vec4 srgba_from_linear(vec4 linear) {
 }
 
 void main() {
-    vec4 texture_color = srgba_from_linear(texture(tex[3], inUV));
+    vec4 texture_color = srgba_from_linear(texture(tex[fontTextureId], inUV));
     outColor = inColor * texture_color;
 }

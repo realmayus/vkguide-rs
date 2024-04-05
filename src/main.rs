@@ -411,7 +411,7 @@ impl App {
                     &vk::ImageViewCreateInfo::default()
                         .image(draw_image.image)
                         .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .format(vk::Format::B8G8R8A8_UNORM)
                         .components(vk::ComponentMapping {
                             r: vk::ComponentSwizzle::IDENTITY,
                             g: vk::ComponentSwizzle::IDENTITY,
@@ -812,13 +812,16 @@ impl App {
             let ctx = SubmitContext::new(self);
             self.egui_pipeline.begin_frame(&self.window);
             let egui_ctx = self.egui_pipeline.context();
-            egui::Window::new( "Hello world!").show(egui_ctx, |ui| {
+            egui::Window::new("Hello world!").show(egui_ctx, |ui| {
                 ui.label("Hello World!");
                 ui.add(egui::Slider::new(&mut self.scene_data.sun_dir.x, 69.0..=420.0).text("AWESOMENESS"));
                 if ui.button("FINALLY!!!!!").clicked() {
                     debug!("huge W");
                 }
-                ui.label("You cannot believe how long this took me... You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...You cannot believe how long this took me...v");
+                ui.colored_label(egui::Color32::RED, "This is red text");
+                ui.colored_label(egui::Color32::GREEN, "This is green text");
+                ui.colored_label(egui::Color32::BLUE, "This is blue text");
+                ui.label("Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed non risus. Suspendisse");
             });
 
             let output = self.egui_pipeline.end_frame(&self.window);

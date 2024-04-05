@@ -450,7 +450,7 @@ impl Texture {
             &ctx.device,
             &mut ctx.allocator.borrow_mut(),
             extent,
-            vk::Format::R8G8B8A8_SRGB,
+            vk::Format::B8G8R8A8_SRGB,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
             AllocUsage::GpuOnly,
             vk::ImageAspectFlags::COLOR,
@@ -472,7 +472,7 @@ impl Texture {
             &ctx.device,
             &mut ctx.allocator.borrow_mut(),
             extent,
-            vk::Format::R8G8B8A8_SRGB,
+            vk::Format::B8G8R8A8_SRGB,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
             AllocUsage::GpuOnly,
             vk::ImageAspectFlags::COLOR,
@@ -604,12 +604,13 @@ impl TextureManager {
         self.descriptor_set
     }
 
-    pub fn add_texture(&mut self, mut texture: Texture, device: &Device, update_set: bool) {
+    pub fn add_texture(&mut self, mut texture: Texture, device: &Device, update_set: bool) -> TextureId {
         texture.id = self.textures.len();
         self.textures.push(texture);
         if update_set {
             self.update_set(device);
         }
+        self.textures.len() - 1
     }
 
     pub fn add_sampler(&mut self, sampler: vk::Sampler) {
